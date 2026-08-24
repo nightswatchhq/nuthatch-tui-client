@@ -64,8 +64,15 @@ struct SqlResponse {
     degraded: bool,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct NestInfo {
+    #[serde(default)]
+    name: String,
+}
+
 #[derive(Default)]
 struct Snapshot {
+    nest_name: Option<String>,
     ready: Ready,
     metrics: BTreeMap<String, f64>,
     tables: Tables,
@@ -239,6 +246,22 @@ fn run(
 }
 
 fn fetch_snapshot(client: &Client, base: &str, selected: Option<&str>) -> Result<Snapshot> {
+    let info: NestInfo = client
+        .get(format!("{base}/"))
+        .send()
+        .context("GET /")?
+        .error_for_status()
+        .context("/ returned an error")?
+        .json()
+        .context("decoding /")?;
+    let schema = client
+        .get(format!("{base}/schema"))
+        .send()
+        .context("GET /schema")?
+        .error_for_status()
+        .context("/schema returned an error")?
+        .text()
+        .context("reading /schema")?;
     let ready = client
         .get(format!("{base}/ready"))
         .send()
@@ -271,6 +294,8 @@ fn fetch_snapshot(client: &Client, base: &str, selected: Option<&str>) -> Result
         .or_else(|| tables.tables.first().map(|table| table.table.clone()));
 
     let mut snapshot = Snapshot {
+        nest_name: nest_name_from_schema(&schema)
+            .or_else(|| (!info.name.is_empty() && info.name != "nuthatch").then_some(info.name)),
         ready,
         metrics,
         tables,
@@ -310,6 +335,15 @@ fn fetch_snapshot(client: &Client, base: &str, selected: Option<&str>) -> Result
         snapshot.recent_events = events.rows;
     }
     Ok(snapshot)
+}
+
+/// `/schema` carries the authored nest name, whereas the compact root document historically
+/// identifies the runtime itself as `nuthatch`.
+fn nest_name_from_schema(schema: &str) -> Option<String> {
+    let line = schema.lines().find(|line| line.starts_with("The `"))?;
+    let rest = line.strip_prefix("The `")?;
+    let (name, _) = rest.split_once("` nest on ")?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 fn parse_prometheus(text: &str) -> BTreeMap<String, f64> {
@@ -401,18 +435,40 @@ fn draw(frame: &mut Frame, app: &App) {
     ])
     .split(area);
 
-    let state =
-        if app.snapshot.ready.ready && !app.snapshot.ready.stalled && !app.snapshot.ready.wedged {
-            ("● LIVE", Color::Green)
-        } else {
-            ("● ATTENTION", Color::Yellow)
-        };
+    let backfill_active = metric_u64(&app.snapshot.metrics, "nuthatch_direct_backfill_active") != 0;
+    let backfill_from = metric_u64(&app.snapshot.metrics, "nuthatch_direct_backfill_from_block");
+    let backfill_current = metric_u64(
+        &app.snapshot.metrics,
+        "nuthatch_direct_backfill_current_block",
+    );
+    let backfill_target = metric_u64(
+        &app.snapshot.metrics,
+        "nuthatch_direct_backfill_target_block",
+    );
+    let state = if backfill_active {
+        ("● BACKFILL", Color::Magenta)
+    } else if app.snapshot.ready.ready && !app.snapshot.ready.stalled && !app.snapshot.ready.wedged
+    {
+        ("● LIVE", Color::Green)
+    } else {
+        ("● ATTENTION", Color::Yellow)
+    };
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             " NUTHATCH ",
             Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
         ),
         Span::styled(" LIVE VIEW", Style::default().fg(Color::White).bold()),
+        Span::styled(
+            format!(
+                "   {}",
+                app.snapshot
+                    .nest_name
+                    .as_deref()
+                    .unwrap_or("discovering nest…")
+            ),
+            Style::default().fg(Color::Cyan).bold(),
+        ),
         Span::styled(format!("   {}", app.url), Style::default().fg(Color::Gray)),
         Span::styled(
             format!("   {} ", state.0),
@@ -437,18 +493,32 @@ fn draw(frame: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled("STATUS  ", Style::default().fg(Color::Gray)),
             Span::styled(
-                if ready.ready { "READY" } else { "WAITING" },
+                if backfill_active {
+                    "BACKFILL"
+                } else if ready.ready {
+                    "READY"
+                } else {
+                    "WAITING"
+                },
                 Style::default().fg(state.1).bold(),
             ),
         ]),
         Line::from(format!("Tip             {}", ready.tip)),
         Line::from(format!("Indexed         {}", ready.last_block)),
         Line::from(format!("Finalised       {}", ready.sealed_through)),
+        Line::from(if backfill_active {
+            format!("Range           {backfill_from}..={backfill_target}")
+        } else {
+            "Range           —".into()
+        }),
     ])
     .block(panel("NEST HEALTH"));
     frame.render_widget(health, top[0]);
 
-    let lag_ratio = if ready.tip == 0 {
+    let lag_ratio = if backfill_active {
+        let span = backfill_target.saturating_sub(backfill_from).max(1);
+        backfill_current.saturating_sub(backfill_from).min(span) as f64 / span as f64
+    } else if ready.tip == 0 {
         0.0
     } else {
         (1.0 - ready.lag_blocks as f64 / ready.tip as f64).clamp(0.0, 1.0)
@@ -472,7 +542,11 @@ fn draw(frame: &mut Frame, app: &App) {
             .block(panel("SYNC POSITION"))
             .gauge_style(Style::default().fg(Color::Magenta))
             .ratio(lag_ratio)
-            .label(format!("{} / {}", ready.last_block, ready.tip)),
+            .label(if backfill_active {
+                format!("{backfill_current} / {backfill_target}")
+            } else {
+                format!("{} / {}", ready.last_block, ready.tip)
+            }),
         top[2],
     );
 
@@ -653,6 +727,16 @@ mod tests {
         assert_eq!(
             normalize_url("http://localhost:8288/".into()),
             "http://localhost:8288"
+        );
+    }
+
+    #[test]
+    fn extracts_authored_nest_name_from_schema() {
+        assert_eq!(
+            nest_name_from_schema(
+                "nuthatch data model\n\nThe `graph-staking-nest` nest on arbitrum-one.\n"
+            ),
+            Some("graph-staking-nest".into())
         );
     }
 }
