@@ -31,7 +31,7 @@ It is a client, not an indexer. It does not need an RPC key, open a store, alter
 | **Data collected** | How many event tables exist, rows decoded, rows sealed, and blocks of lag? |
 | **Sync position** | How closely the committed cursor follows the chain tip. |
 | **Indexed tables** | The event tables exposed by the nest's schema. |
-| **Performance** | RPC requests per second and minute, decode throughput, API refresh time, source-poll age, process RSS, and reorg count. |
+| **Performance** | Rolling RPC request, RPC method, decoded-row, and indexed-block rates; lifetime counters; API refresh time; source-poll age; RSS; and reorg count. Press `w` to choose a 15-, 60-, or 90-second rolling window. |
 | **Selected table** | Row count and latest block for the selected event table. |
 | **Live event feed** | The six newest decoded rows for the selected table. |
 | **RPC activity** | Recent changes in the RPC request counter, sampled once per dashboard refresh. |
@@ -74,6 +74,7 @@ cargo run --release -- --url http://127.0.0.1:8288
 |---|---|
 | `r` | Refresh immediately. |
 | `Up` / `Down` or `k` / `j` | Select an event table and refresh its summary and event feed. |
+| `w` | Cycle the rolling-rate window: 15, 60, or 90 seconds. |
 | `q` or `Esc` | Exit cleanly. |
 
 The dashboard otherwise refreshes every two seconds.
@@ -105,16 +106,33 @@ The client uses only public, read-only Nuthatch endpoints:
 | Endpoint | Use |
 |---|---|
 | `GET /ready` | Readiness, head positions, lag, and stall state. |
-| `GET /metrics` | Prometheus counters for decoded rows, sealed rows, reorgs, and RPC requests. |
+| `GET /` and `GET /schema` | Runtime and authored nest identity. |
+| `GET /metrics` | Prometheus counters and gauges for rows, RPC activity, process RSS, reorgs, and positions. |
 | `GET /tables` | The event-table catalogue. |
 | `GET /sql?q=…` | A small summary query for the first available event table. |
 
 It makes no HTTP mutation request and never touches the nest's redb or Parquet files. This also means it can run from another machine if the Nuthatch API is intentionally exposed and protected by the operator's normal network controls.
 
+## Performance measurements
+
+The performance panel separates values reported since the Nuthatch process started from rolling rates calculated locally from successive `/metrics` samples. Process-lifetime counters reset when Nuthatch restarts; rolling rates naturally settle again after the selected window. The client labels the two forms separately.
+
+| Measurement | Source | Scope |
+|---|---|---|
+| RPC requests | `nuthatch_rpc_requests_total` | Outbound JSON-RPC HTTP request or batch envelopes since process start. Includes failover retries. |
+| RPC methods | `nuthatch_rpc_methods_total` | Sum of labelled method-counter series since process start. A batch can contain many methods. |
+| Decoded rows and reorgs | `nuthatch_rows_decoded_total`, `nuthatch_reorgs_total` | Process-lifetime counters. |
+| Indexed blocks | `last_block` from `/ready` | Difference over the selected rolling window, not a process counter. |
+| Resident memory | `nuthatch_rss_bytes` | Current process RSS as reported by Nuthatch. It is shown as `unavailable` when that metric is absent. |
+| API refresh and source-poll age | Client timing and `/ready` | Current client request time and seconds since Nuthatch's last successful source poll. |
+
+CPU use, hot-store and sealed-segment disk use, and RPC endpoint failures, retries, and latency are not presently published by the Nuthatch API. The dashboard explicitly marks them unavailable. It does not inspect the local process, filesystem, or RPC provider to fill those gaps, because that would make remote operation and the read-only boundary rather less clear than advertised.
+
 ## Current limits
 
 - The client is a dashboard, not a general SQL workbench. It presents a summary and a six-row live feed for the selected event table.
 - It reports request count, not exact provider cost. Billing models differ by provider and method.
+- CPU, disk, and RPC endpoint health require Nuthatch to publish additional metrics before this client can display them honestly.
 - A remote Nuthatch endpoint must be deliberately exposed by its operator. The default assumes a localhost service.
 - The screen is currently designed for an 80-column or wider terminal. It remains usable narrower, but tables will necessarily have less room to breathe.
 

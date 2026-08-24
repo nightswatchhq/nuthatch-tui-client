@@ -22,6 +22,11 @@ use serde_json::Value;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const HISTORY_LEN: usize = 48;
+const RATE_WINDOWS: [Duration; 3] = [
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+    Duration::from_secs(90),
+];
 
 #[derive(Debug, Deserialize, Default, Clone)]
 struct Ready {
@@ -88,12 +93,15 @@ struct Sample {
     at: Instant,
     decoded_rows: u64,
     rpc_requests: u64,
+    rpc_methods: u64,
+    indexed_block: u64,
 }
 
 struct App {
     url: String,
     snapshot: Snapshot,
     samples: Vec<Sample>,
+    rate_window: usize,
     selected_table: usize,
     refresh_time: Option<Duration>,
     last_refresh: Instant,
@@ -107,6 +115,7 @@ impl App {
             url,
             snapshot: Snapshot::default(),
             samples: Vec::new(),
+            rate_window: 1,
             selected_table: 0,
             refresh_time: None,
             last_refresh: Instant::now() - POLL_INTERVAL,
@@ -134,6 +143,8 @@ impl App {
                     at: Instant::now(),
                     decoded_rows: metric_u64(&snapshot.metrics, "nuthatch_rows_decoded_total"),
                     rpc_requests: metric_u64(&snapshot.metrics, "nuthatch_rpc_requests_total"),
+                    rpc_methods: metric_u64(&snapshot.metrics, "nuthatch_rpc_methods_total"),
+                    indexed_block: snapshot.ready.last_block,
                 });
                 if self.samples.len() > HISTORY_LEN {
                     self.samples.remove(0);
@@ -164,15 +175,45 @@ impl App {
     }
 
     fn rate(&self, field: impl Fn(Sample) -> u64) -> f64 {
-        let Some([before, after]) = self.samples.as_slice().windows(2).last() else {
+        let Some(after) = self.samples.last().copied() else {
+            return 0.0;
+        };
+        let window = RATE_WINDOWS[self.rate_window];
+        let before = self
+            .samples
+            .iter()
+            .rev()
+            .copied()
+            .find(|sample| after.at.duration_since(sample.at) >= window)
+            .or_else(|| self.samples.first().copied());
+        let Some(before) = before else {
             return 0.0;
         };
         let elapsed = after.at.duration_since(before.at).as_secs_f64();
         if elapsed == 0.0 {
             0.0
         } else {
-            field(*after).saturating_sub(field(*before)) as f64 / elapsed
+            field(after).saturating_sub(field(before)) as f64 / elapsed
         }
+    }
+
+    fn rate_window_label(&self) -> String {
+        let target = RATE_WINDOWS[self.rate_window].as_secs();
+        let observed = self
+            .samples
+            .first()
+            .zip(self.samples.last())
+            .map(|(first, last)| last.at.duration_since(first.at).as_secs())
+            .unwrap_or_default();
+        if observed < target {
+            format!("warming {observed}/{target}s")
+        } else {
+            format!("last {target}s")
+        }
+    }
+
+    fn cycle_rate_window(&mut self) {
+        self.rate_window = (self.rate_window + 1) % RATE_WINDOWS.len();
     }
 }
 
@@ -234,6 +275,7 @@ fn run(
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
                 KeyCode::Char('r') => app.refresh(client),
+                KeyCode::Char('w') => app.cycle_rate_window(),
                 KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
                 _ => {}
@@ -351,16 +393,21 @@ fn parse_prometheus(text: &str) -> BTreeMap<String, f64> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| {
             let (name, value) = line.split_once(' ')?;
-            if name.contains('{') {
-                return None;
-            }
-            Some((name.to_string(), value.parse().ok()?))
+            let name = name.split_once('{').map_or(name, |(name, _)| name);
+            Some((name.to_string(), value.parse::<f64>().ok()?))
         })
-        .collect()
+        .fold(BTreeMap::new(), |mut metrics, (name, value)| {
+            *metrics.entry(name).or_default() += value;
+            metrics
+        })
 }
 
 fn metric_u64(metrics: &BTreeMap<String, f64>, name: &str) -> u64 {
-    metrics.get(name).copied().unwrap_or_default() as u64
+    metric_opt_u64(metrics, name).unwrap_or_default()
+}
+
+fn metric_opt_u64(metrics: &BTreeMap<String, f64>, name: &str) -> Option<u64> {
+    metrics.get(name).copied().map(|value| value as u64)
 }
 
 fn format_rate(value: f64, unit: &str) -> String {
@@ -379,6 +426,10 @@ fn format_bytes(value: u64) -> String {
         value if value < 1024 * 1024 => format!("{} KiB", value / 1024),
         value => format!("{:.1} MiB", value as f64 / (1024.0 * 1024.0)),
     }
+}
+
+fn format_optional_bytes(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".into(), format_bytes)
 }
 
 fn shorten(value: &str, width: usize) -> String {
@@ -581,8 +632,8 @@ fn draw(frame: &mut Frame, app: &App) {
     );
 
     let right =
-        Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).split(bottom[1]);
-    let show_sparkline = right[0].height >= 13;
+        Layout::vertical([Constraint::Percentage(68), Constraint::Percentage(32)]).split(bottom[1]);
+    let show_sparkline = right[0].height >= 16;
     let performance_area = if show_sparkline {
         Layout::vertical([Constraint::Min(8), Constraint::Length(4)]).split(right[0])
     } else {
@@ -591,6 +642,7 @@ fn draw(frame: &mut Frame, app: &App) {
     let performance = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(performance_area[0]);
     let rpc = metric_u64(&app.snapshot.metrics, "nuthatch_rpc_requests_total");
+    let rpc_methods = metric_u64(&app.snapshot.metrics, "nuthatch_rpc_methods_total");
     let reorgs = metric_u64(&app.snapshot.metrics, "nuthatch_reorgs_total");
     let selected = app
         .snapshot
@@ -598,34 +650,57 @@ fn draw(frame: &mut Frame, app: &App) {
         .as_deref()
         .unwrap_or("no event tables");
     let rpc_per_second = app.rate(|sample| sample.rpc_requests);
+    let method_per_second = app.rate(|sample| sample.rpc_methods);
     let decode_per_second = app.rate(|sample| sample.decoded_rows);
+    let blocks_per_second = app.rate(|sample| sample.indexed_block);
     let activity = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("RPC TOTAL  ", Style::default().fg(Color::Gray)),
+            Span::styled("ROLLING WINDOW  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                app.rate_window_label(),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::styled("  (w to change)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("RPC REQUESTS  ", Style::default().fg(Color::Gray)),
             Span::styled(rpc.to_string(), Style::default().fg(Color::Yellow).bold()),
+            Span::styled(" since start", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(format!(
-            "RPC rate        {}",
-            format_rate(rpc_per_second, "req/s")
-        )),
-        Line::from(format!(
-            "RPC rate        {}",
+            "  rate          {}  {}",
+            format_rate(rpc_per_second, "req/s"),
             format_rate(rpc_per_second * 60.0, "req/min")
         )),
         Line::from(format!(
-            "Decode rate     {}",
-            format_rate(decode_per_second, "rows/s")
+            "RPC METHODS     {rpc_methods} since start  {}",
+            format_rate(method_per_second, "calls/s")
         )),
         Line::from(format!(
-            "API refresh     {} ms",
-            app.refresh_time.map_or(0, |time| time.as_millis())
+            "DECODED ROWS    {} since start  {}  {}",
+            metric_u64(&app.snapshot.metrics, "nuthatch_rows_decoded_total"),
+            format_rate(decode_per_second, "rows/s"),
+            format_rate(decode_per_second * 60.0, "rows/min")
         )),
-        Line::from(format!("Source poll age {} s", ready.seconds_since_poll)),
         Line::from(format!(
-            "RSS             {}",
-            format_bytes(metric_u64(&app.snapshot.metrics, "nuthatch_rss_bytes"))
+            "INDEXED BLOCKS  {}  {}",
+            format_rate(blocks_per_second, "blocks/s"),
+            format_rate(blocks_per_second * 60.0, "blocks/min")
         )),
-        Line::from(format!("Reorgs          {reorgs}")),
+        Line::from(format!(
+            "MEMORY RSS      {}",
+            format_optional_bytes(metric_opt_u64(&app.snapshot.metrics, "nuthatch_rss_bytes"))
+        )),
+        Line::from(format!(
+            "API REFRESH     {} ms  source poll age {} s",
+            app.refresh_time.map_or(0, |time| time.as_millis()),
+            ready.seconds_since_poll
+        )),
+        Line::from(format!("REORGS          {reorgs} since start")),
+        Line::from(Span::styled(
+            "CPU, disk, RPC health: unavailable from Nuthatch",
+            Style::default().fg(Color::DarkGray),
+        )),
     ])
     .block(panel("PERFORMANCE"));
     frame.render_widget(activity, performance[0]);
@@ -719,7 +794,16 @@ mod tests {
             "# HELP ignored\nnuthatch_rows_decoded_total 42\nnuthatch_nest_rows_decoded_total{nest=\"x\"} 41\n",
         );
         assert_eq!(metrics.get("nuthatch_rows_decoded_total"), Some(&42.0));
-        assert!(!metrics.contains_key("nuthatch_nest_rows_decoded_total{nest=\"x\"}"));
+        assert_eq!(metrics.get("nuthatch_nest_rows_decoded_total"), Some(&41.0));
+    }
+
+    #[test]
+    fn prometheus_parser_sums_labelled_counter_series() {
+        let metrics = parse_prometheus(
+            "nuthatch_rpc_methods_total{method=\"eth_getLogs\"} 4\n\
+             nuthatch_rpc_methods_total{method=\"eth_getBlockByNumber\"} 9\n",
+        );
+        assert_eq!(metrics.get("nuthatch_rpc_methods_total"), Some(&13.0));
     }
 
     #[test]
