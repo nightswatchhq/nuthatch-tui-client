@@ -728,13 +728,15 @@ fn draw(frame: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled("RPC REQUESTS  ", Style::default().fg(Color::Gray)),
             Span::styled(rpc.to_string(), Style::default().fg(Color::Yellow).bold()),
-            Span::styled(" since start", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    " since start  {}  {}",
+                    format_rate(rpc_per_second, "req/s"),
+                    format_rate(rpc_per_second * 60.0, "req/min")
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
-        Line::from(format!(
-            "  rate          {}  {}",
-            format_rate(rpc_per_second, "req/s"),
-            format_rate(rpc_per_second * 60.0, "req/min")
-        )),
         Line::from(format!(
             "RPC METHODS     {rpc_methods} since start  {}",
             format_rate(method_per_second, "calls/s")
@@ -759,9 +761,8 @@ fn draw(frame: &mut Frame, app: &App) {
             app.refresh_time.map_or(0, |time| time.as_millis()),
             ready.seconds_since_poll
         )),
-        Line::from(format!("REORGS          {reorgs} since start")),
         Line::from(format!(
-            "CPU             {}",
+            "REORGS  {reorgs} since start   CPU  {}",
             format_cpu_percent(app.cpu_percent())
         )),
         Line::from(format!(
