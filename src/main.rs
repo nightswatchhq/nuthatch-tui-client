@@ -95,6 +95,7 @@ struct Sample {
     rpc_requests: u64,
     rpc_methods: u64,
     indexed_block: u64,
+    cpu_seconds: Option<f64>,
 }
 
 struct App {
@@ -145,6 +146,10 @@ impl App {
                     rpc_requests: metric_u64(&snapshot.metrics, "nuthatch_rpc_requests_total"),
                     rpc_methods: metric_u64(&snapshot.metrics, "nuthatch_rpc_methods_total"),
                     indexed_block: snapshot.ready.last_block,
+                    cpu_seconds: snapshot
+                        .metrics
+                        .get("nuthatch_process_cpu_seconds_total")
+                        .copied(),
                 });
                 if self.samples.len() > HISTORY_LEN {
                     self.samples.remove(0);
@@ -194,6 +199,34 @@ impl App {
             0.0
         } else {
             field(after).saturating_sub(field(before)) as f64 / elapsed
+        }
+    }
+
+    /// `Some(None)` distinguishes "the metric is published but we're still warming up a window"
+    /// from `None`, "this Nuthatch does not publish `nuthatch_process_cpu_seconds_total` at all".
+    /// Nuthatch's own sampler only reads `/proc/self/stat`, so on a non-Linux Nuthatch host the
+    /// counter is published but pinned at exactly 0.0 forever — that reads as `Some(Some(0.0))`
+    /// here, a real but permanently misleading zero the client cannot itself distinguish from an
+    /// idle process (nightswatchhq/nuthatch#844).
+    fn cpu_percent(&self) -> Option<Option<f64>> {
+        let after = self.samples.last().copied()?;
+        let after_cpu = after.cpu_seconds?;
+        let window = RATE_WINDOWS[self.rate_window];
+        let before = self
+            .samples
+            .iter()
+            .rev()
+            .copied()
+            .find(|sample| after.at.duration_since(sample.at) >= window)
+            .or_else(|| self.samples.first().copied())?;
+        let Some(before_cpu) = before.cpu_seconds else {
+            return Some(None);
+        };
+        let elapsed = after.at.duration_since(before.at).as_secs_f64();
+        if elapsed <= 0.0 {
+            Some(None)
+        } else {
+            Some(Some(((after_cpu - before_cpu).max(0.0) / elapsed) * 100.0))
         }
     }
 
@@ -408,6 +441,36 @@ fn metric_u64(metrics: &BTreeMap<String, f64>, name: &str) -> u64 {
 
 fn metric_opt_u64(metrics: &BTreeMap<String, f64>, name: &str) -> Option<u64> {
     metrics.get(name).copied().map(|value| value as u64)
+}
+
+fn format_optional_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".into(), |value| value.to_string())
+}
+
+/// `cpu_percent` carries the same `Option<Option<f64>>` distinction as `App::cpu_percent`.
+fn format_cpu_percent(cpu_percent: Option<Option<f64>>) -> String {
+    match cpu_percent {
+        None => "unavailable (older Nuthatch)".into(),
+        Some(None) => "warming up".into(),
+        Some(Some(percent)) => format!("{percent:.1}%"),
+    }
+}
+
+/// `None` = Nuthatch does not publish the histogram at all; `Some(None)` = published but no RPC
+/// call has been observed yet; `Some(Some(ms))` = average round-trip in milliseconds, summed
+/// across every RPC endpoint the way the rest of this client already aggregates labelled series.
+fn rpc_latency_ms(metrics: &BTreeMap<String, f64>) -> Option<Option<f64>> {
+    let sum = metrics.get("nuthatch_rpc_request_duration_seconds_sum")?;
+    let count = metrics.get("nuthatch_rpc_request_duration_seconds_count")?;
+    Some((*count > 0.0).then(|| sum / count * 1000.0))
+}
+
+fn format_rpc_latency(latency: Option<Option<f64>>) -> String {
+    match latency {
+        None => "unavailable".into(),
+        Some(None) => "no calls yet".into(),
+        Some(Some(ms)) => format!("{ms:.0} ms avg"),
+    }
 }
 
 fn format_rate(value: f64, unit: &str) -> String {
@@ -697,9 +760,32 @@ fn draw(frame: &mut Frame, app: &App) {
             ready.seconds_since_poll
         )),
         Line::from(format!("REORGS          {reorgs} since start")),
-        Line::from(Span::styled(
-            "CPU, disk, RPC health: unavailable from Nuthatch",
-            Style::default().fg(Color::DarkGray),
+        Line::from(format!(
+            "CPU             {}",
+            format_cpu_percent(app.cpu_percent())
+        )),
+        Line::from(format!(
+            "DISK            hot {}  sealed {}",
+            format_optional_bytes(metric_opt_u64(
+                &app.snapshot.metrics,
+                "nuthatch_hot_store_bytes"
+            )),
+            format_optional_bytes(metric_opt_u64(
+                &app.snapshot.metrics,
+                "nuthatch_sealed_segments_bytes"
+            )),
+        )),
+        Line::from(format!(
+            "RPC HEALTH      fail {}  retry {}  latency {}",
+            format_optional_count(metric_opt_u64(
+                &app.snapshot.metrics,
+                "nuthatch_rpc_endpoint_failures_total"
+            )),
+            format_optional_count(metric_opt_u64(
+                &app.snapshot.metrics,
+                "nuthatch_rpc_endpoint_retries_total"
+            )),
+            format_rpc_latency(rpc_latency_ms(&app.snapshot.metrics)),
         )),
     ])
     .block(panel("PERFORMANCE"));
@@ -811,6 +897,97 @@ mod tests {
         assert_eq!(
             normalize_url("http://localhost:8288/".into()),
             "http://localhost:8288"
+        );
+    }
+
+    #[test]
+    fn cpu_percent_is_unavailable_when_metric_absent() {
+        assert_eq!(format_cpu_percent(None), "unavailable (older Nuthatch)");
+    }
+
+    #[test]
+    fn cpu_percent_warms_up_before_a_second_sample() {
+        assert_eq!(format_cpu_percent(Some(None)), "warming up");
+    }
+
+    #[test]
+    fn cpu_percent_formats_one_decimal() {
+        assert_eq!(format_cpu_percent(Some(Some(12.34))), "12.3%");
+    }
+
+    #[test]
+    fn rpc_latency_is_unavailable_without_the_histogram() {
+        let metrics = BTreeMap::new();
+        assert_eq!(rpc_latency_ms(&metrics), None);
+    }
+
+    #[test]
+    fn rpc_latency_is_no_calls_yet_with_zero_count() {
+        let mut metrics = BTreeMap::new();
+        metrics.insert("nuthatch_rpc_request_duration_seconds_sum".into(), 0.0);
+        metrics.insert("nuthatch_rpc_request_duration_seconds_count".into(), 0.0);
+        assert_eq!(rpc_latency_ms(&metrics), Some(None));
+    }
+
+    #[test]
+    fn rpc_latency_averages_sum_over_count_in_milliseconds() {
+        let mut metrics = BTreeMap::new();
+        metrics.insert("nuthatch_rpc_request_duration_seconds_sum".into(), 2.0);
+        metrics.insert("nuthatch_rpc_request_duration_seconds_count".into(), 4.0);
+        assert_eq!(rpc_latency_ms(&metrics), Some(Some(500.0)));
+    }
+
+    /// A real `/metrics` snippet captured from a running `nuthatch dev` (v2.7.1) against two RPC
+    /// endpoints, macOS host. Guards against silent drift in Nuthatch's exposition format.
+    #[test]
+    fn live_metrics_snippet_parses_and_formats() {
+        let metrics = parse_prometheus(
+            "nuthatch_rss_bytes 63963136\n\
+             nuthatch_process_cpu_seconds_total 0.000000\n\
+             nuthatch_hot_store_bytes 2113536\n\
+             nuthatch_sealed_segments_bytes 48731\n\
+             nuthatch_rpc_endpoint_requests_total{endpoint=\"eth-pokt.nodies.app\"} 35\n\
+             nuthatch_rpc_endpoint_failures_total{endpoint=\"eth-pokt.nodies.app\"} 35\n\
+             nuthatch_rpc_endpoint_retries_total{endpoint=\"eth-pokt.nodies.app\"} 34\n\
+             nuthatch_rpc_request_duration_seconds_sum{endpoint=\"eth-pokt.nodies.app\"} 1.5274509169999997\n\
+             nuthatch_rpc_request_duration_seconds_count{endpoint=\"eth-pokt.nodies.app\"} 35\n\
+             nuthatch_rpc_endpoint_requests_total{endpoint=\"eth.drpc.org\"} 186\n\
+             nuthatch_rpc_endpoint_failures_total{endpoint=\"eth.drpc.org\"} 34\n\
+             nuthatch_rpc_endpoint_retries_total{endpoint=\"eth.drpc.org\"} 1\n\
+             nuthatch_rpc_request_duration_seconds_sum{endpoint=\"eth.drpc.org\"} 13.819300575999996\n\
+             nuthatch_rpc_request_duration_seconds_count{endpoint=\"eth.drpc.org\"} 186\n",
+        );
+
+        assert_eq!(
+            format_optional_bytes(metric_opt_u64(&metrics, "nuthatch_hot_store_bytes")),
+            "2.0 MiB"
+        );
+        assert_eq!(
+            format_optional_bytes(metric_opt_u64(&metrics, "nuthatch_sealed_segments_bytes")),
+            "47 KiB"
+        );
+        // Failures/retries sum across both labelled endpoints, matching how RPC methods already sum.
+        assert_eq!(
+            format_optional_count(metric_opt_u64(
+                &metrics,
+                "nuthatch_rpc_endpoint_failures_total"
+            )),
+            "69"
+        );
+        assert_eq!(
+            format_optional_count(metric_opt_u64(
+                &metrics,
+                "nuthatch_rpc_endpoint_retries_total"
+            )),
+            "35"
+        );
+        // (1.5274509169999997 + 13.819300575999996) / (35 + 186) * 1000 ≈ 69.5 ms
+        assert_eq!(format_rpc_latency(rpc_latency_ms(&metrics)), "69 ms avg");
+        // Nuthatch's CPU sampler is Linux-only (nightswatchhq/nuthatch#844); on this macOS capture
+        // the counter is present but pinned at 0.0 — a real value, not a missing one.
+        assert_eq!(
+            metrics.get("nuthatch_process_cpu_seconds_total"),
+            Some(&0.0)
         );
     }
 
