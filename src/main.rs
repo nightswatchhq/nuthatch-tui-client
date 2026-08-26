@@ -22,6 +22,9 @@ use serde_json::Value;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const HISTORY_LEN: usize = 48;
+/// Labelled metric lines in the performance panel. The panel is laid out at exactly this height so
+/// that none of them is silently cropped; raise it with the panel.
+const PERFORMANCE_LINES: u16 = 9;
 const RATE_WINDOWS: [Duration; 3] = [
     Duration::from_secs(15),
     Duration::from_secs(60),
@@ -204,10 +207,11 @@ impl App {
 
     /// `Some(None)` distinguishes "the metric is published but we're still warming up a window"
     /// from `None`, "this Nuthatch does not publish `nuthatch_process_cpu_seconds_total` at all".
-    /// Nuthatch's own sampler only reads `/proc/self/stat`, so on a non-Linux Nuthatch host the
-    /// counter is published but pinned at exactly 0.0 forever — that reads as `Some(Some(0.0))`
-    /// here, a real but permanently misleading zero the client cannot itself distinguish from an
-    /// idle process (nightswatchhq/nuthatch#844).
+    /// There is a third case the client cannot see. Nuthatch's sampler read `/proc/self/stat` and
+    /// nothing else until nightswatchhq/nuthatch#844, so a nest on any released Nuthatch up to
+    /// v2.7.2, hosted off Linux, publishes the counter pinned at exactly 0.0 forever. That arrives
+    /// here as `Some(Some(0.0))`, indistinguishable from a genuinely idle process. Nuthatch main
+    /// has the `ps -o time=` fallback; no tag carries it yet.
     fn cpu_percent(&self) -> Option<Option<f64>> {
         let after = self.samples.last().copied()?;
         let after_cpu = after.cpu_seconds?;
@@ -483,9 +487,12 @@ fn format_rate(value: f64, unit: &str) -> String {
     }
 }
 
+/// A zero here is a fact, not a gap: a nest that has sealed nothing yet genuinely occupies no
+/// bytes, and saying `unavailable` would be the same misreport in the other direction. Absence is
+/// `format_optional_bytes`'s job.
 fn format_bytes(value: u64) -> String {
     match value {
-        0 => "unavailable".into(),
+        value if value < 1024 => format!("{value} B"),
         value if value < 1024 * 1024 => format!("{} KiB", value / 1024),
         value => format!("{:.1} MiB", value as f64 / (1024.0 * 1024.0)),
     }
@@ -526,9 +533,9 @@ fn event_line(row: &Value) -> String {
     format!("#{block:<10} {details}")
 }
 
-fn panel(title: &str) -> Block<'_> {
+fn panel<'a>(title: &str) -> Block<'a> {
     Block::default()
-        .title(Line::from(title).style(Style::default().fg(Color::Cyan).bold()))
+        .title(Line::from(format!(" {title} ")).style(Style::default().fg(Color::Cyan).bold()))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -543,7 +550,7 @@ fn draw(frame: &mut Frame, app: &App) {
     );
     let vertical = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(9),
+        Constraint::Length(7),
         Constraint::Min(10),
         Constraint::Length(3),
     ])
@@ -666,6 +673,21 @@ fn draw(frame: &mut Frame, app: &App) {
 
     let bottom = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(vertical[2]);
+    // Several performance lines are wider than half the right-hand column, and at 100 columns the
+    // panel used to lose both the disk and the RPC-health line off the bottom. It now takes the
+    // right column whole, at a height fixed to its line count, and the selected-table summary
+    // moves under the table list where four short lines sit comfortably at 38%.
+    let left = Layout::vertical([Constraint::Min(4), Constraint::Length(6)]).split(bottom[0]);
+    // The feed is the first thing to go when the terminal is short: a cropped metric line is a
+    // misreport, whereas a missing feed is visibly missing.
+    let panel_height = PERFORMANCE_LINES + 2;
+    let show_feed = bottom[1].height >= panel_height + 3;
+    let right = if show_feed {
+        Layout::vertical([Constraint::Length(panel_height), Constraint::Min(3)]).split(bottom[1])
+    } else {
+        Layout::vertical([Constraint::Percentage(100)]).split(bottom[1])
+    };
+    let show_sparkline = show_feed && right[1].height >= 9;
     let rows: Vec<ListItem> = app
         .snapshot
         .tables
@@ -691,19 +713,9 @@ fn draw(frame: &mut Frame, app: &App) {
         .collect();
     frame.render_widget(
         List::new(rows).block(panel("INDEXED TABLES  ↑↓ / j k to inspect")),
-        bottom[0],
+        left[0],
     );
 
-    let right =
-        Layout::vertical([Constraint::Percentage(68), Constraint::Percentage(32)]).split(bottom[1]);
-    let show_sparkline = right[0].height >= 16;
-    let performance_area = if show_sparkline {
-        Layout::vertical([Constraint::Min(8), Constraint::Length(4)]).split(right[0])
-    } else {
-        Layout::vertical([Constraint::Percentage(100)]).split(right[0])
-    };
-    let performance = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
-        .split(performance_area[0]);
     let rpc = metric_u64(&app.snapshot.metrics, "nuthatch_rpc_requests_total");
     let rpc_methods = metric_u64(&app.snapshot.metrics, "nuthatch_rpc_methods_total");
     let reorgs = metric_u64(&app.snapshot.metrics, "nuthatch_reorgs_total");
@@ -717,14 +729,6 @@ fn draw(frame: &mut Frame, app: &App) {
     let decode_per_second = app.rate(|sample| sample.decoded_rows);
     let blocks_per_second = app.rate(|sample| sample.indexed_block);
     let activity = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("ROLLING WINDOW  ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                app.rate_window_label(),
-                Style::default().fg(Color::Cyan).bold(),
-            ),
-            Span::styled("  (w to change)", Style::default().fg(Color::DarkGray)),
-        ]),
         Line::from(vec![
             Span::styled("RPC REQUESTS  ", Style::default().fg(Color::Gray)),
             Span::styled(rpc.to_string(), Style::default().fg(Color::Yellow).bold()),
@@ -789,8 +793,11 @@ fn draw(frame: &mut Frame, app: &App) {
             format_rpc_latency(rpc_latency_ms(&app.snapshot.metrics)),
         )),
     ])
-    .block(panel("PERFORMANCE"));
-    frame.render_widget(activity, performance[0]);
+    .block(panel(&format!(
+        "PERFORMANCE  rates {}  (w)",
+        app.rate_window_label()
+    )));
+    frame.render_widget(activity, right[0]);
 
     let summary = Paragraph::new(vec![
         Line::from(Span::styled(
@@ -824,7 +831,7 @@ fn draw(frame: &mut Frame, app: &App) {
     ])
     .block(panel("SELECTED TABLE"))
     .wrap(Wrap { trim: true });
-    frame.render_widget(summary, performance[1]);
+    frame.render_widget(summary, left[1]);
     let rpc_samples: Vec<u64> = app
         .samples
         .windows(2)
@@ -836,18 +843,25 @@ fn draw(frame: &mut Frame, app: &App) {
         .iter()
         .map(|row| ListItem::new(Line::from(event_line(row))))
         .collect();
-    frame.render_widget(
-        List::new(feed_rows).block(panel("LIVE EVENT FEED")),
-        right[1],
-    );
-    if show_sparkline {
+    if show_feed {
+        let feed_area = if show_sparkline {
+            Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(right[1])
+        } else {
+            Layout::vertical([Constraint::Percentage(100)]).split(right[1])
+        };
         frame.render_widget(
-            Sparkline::default()
-                .block(panel("RPC ACTIVITY / REFRESH"))
-                .data(&rpc_samples)
-                .style(Style::default().fg(Color::Yellow)),
-            performance_area[1],
+            List::new(feed_rows).block(panel("LIVE EVENT FEED")),
+            feed_area[0],
         );
+        if show_sparkline {
+            frame.render_widget(
+                Sparkline::default()
+                    .block(panel("RPC ACTIVITY / REFRESH"))
+                    .data(&rpc_samples)
+                    .style(Style::default().fg(Color::Yellow)),
+                feed_area[1],
+            );
+        }
     }
 
     let footer = Paragraph::new(Line::from(vec![
@@ -866,6 +880,11 @@ fn draw(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::Black).bg(Color::Gray).bold(),
         ),
         Span::raw(" tables   "),
+        Span::styled(
+            " w ",
+            Style::default().fg(Color::Black).bg(Color::Gray).bold(),
+        ),
+        Span::raw(" rate window   "),
         Span::styled(&app.status, Style::default().fg(Color::DarkGray)),
     ]));
     frame.render_widget(footer, vertical[3]);
@@ -874,6 +893,156 @@ fn draw(frame: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+
+    /// A dashboard populated the way a healthy mainnet nest populates it, for the layout tests.
+    fn rendered(width: u16, height: u16) -> String {
+        let mut app = App::new("http://127.0.0.1:8288".into());
+        app.snapshot.nest_name = Some("graph-staking-nest".into());
+        app.snapshot.ready = Ready {
+            ready: true,
+            lag_blocks: 0,
+            last_block: 25_766_811,
+            sealed_through: 25_766_747,
+            tip: 25_766_811,
+            seconds_since_poll: 1,
+            ..Ready::default()
+        };
+        app.snapshot.metrics = parse_prometheus(
+            "nuthatch_rows_decoded_total 2275\n\
+             nuthatch_rows_sealed_total 2453\n\
+             nuthatch_rpc_requests_total 367\n\
+             nuthatch_rpc_methods_total 412\n\
+             nuthatch_reorgs_total 0\n\
+             nuthatch_rss_bytes 63963136\n\
+             nuthatch_process_cpu_seconds_total 4.5\n\
+             nuthatch_hot_store_bytes 2113536\n\
+             nuthatch_sealed_segments_bytes 48731\n\
+             nuthatch_rpc_endpoint_failures_total 69\n\
+             nuthatch_rpc_endpoint_retries_total 35\n\
+             nuthatch_rpc_request_duration_seconds_sum 15.3\n\
+             nuthatch_rpc_request_duration_seconds_count 221\n",
+        );
+        app.snapshot.tables = Tables {
+            count: 2,
+            tables: vec![
+                EventTable {
+                    table: "usdc__approval".into(),
+                },
+                EventTable {
+                    table: "usdc__transfer".into(),
+                },
+            ],
+        };
+        app.snapshot.selected_table = Some("usdc__approval".into());
+        app.snapshot.selected_rows = Some(2275);
+        app.snapshot.selected_latest_block = Some(25_766_811);
+        app.refresh_time = Some(Duration::from_millis(12));
+        // Two samples a full window apart, so the rolling rates render at a realistic width
+        // rather than the flattering "0 req/s" a single sample would give.
+        let now = Instant::now();
+        let earlier = now
+            .checked_sub(Duration::from_secs(60))
+            .expect("a host that has been up for a minute");
+        app.samples = vec![
+            Sample {
+                at: earlier,
+                decoded_rows: 1000,
+                rpc_requests: 300,
+                rpc_methods: 340,
+                indexed_block: 25_766_741,
+                cpu_seconds: Some(2.4),
+            },
+            Sample {
+                at: now,
+                decoded_rows: 2275,
+                rpc_requests: 367,
+                rpc_methods: 412,
+                indexed_block: 25_766_811,
+                cpu_seconds: Some(4.5),
+            },
+        ];
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The README advertises 100 columns as the pleasant setting, so 100 columns is where the
+    /// panel has to hold every line it claims to show. It used to crop the last two entirely.
+    #[test]
+    fn performance_panel_shows_every_metric_at_one_hundred_columns() {
+        let screen = rendered(100, 30);
+        for expected in [
+            "PERFORMANCE  rates last 60s  (w)",
+            "RPC REQUESTS  367 since start  1.1 req/s  67 req/min",
+            "RPC METHODS     412 since start  1.2 calls/s",
+            "DECODED ROWS    2275 since start  21 rows/s  1275 rows/min",
+            "INDEXED BLOCKS  1.2 blocks/s  70 blocks/min",
+            "MEMORY RSS      61.0 MiB",
+            "API REFRESH     12 ms  source poll age 1 s",
+            "REORGS  0 since start   CPU  ",
+            "DISK            hot 2.0 MiB  sealed 47 KiB",
+            "RPC HEALTH      fail 69  retry 35  latency 69 ms avg",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "performance panel dropped or truncated {expected:?} at 100x30:\n{screen}"
+            );
+        }
+    }
+
+    /// The selected-table summary and the event feed have to survive the same squeeze.
+    #[test]
+    fn table_summary_and_feed_survive_at_one_hundred_columns() {
+        let screen = rendered(100, 30);
+        for expected in [
+            "SELECTED TABLE",
+            "usdc__approval",
+            "Rows    2275",
+            "Latest  25766811",
+            "Storage integrity: healthy",
+            "LIVE EVENT FEED",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "{expected:?} missing at 100x30:\n{screen}"
+            );
+        }
+    }
+
+    /// The sparkline is the last thing to arrive, and the README quotes the height at which it
+    /// does. Asserting the boundary keeps that sentence honest.
+    #[test]
+    fn the_sparkline_arrives_at_thirty_three_rows() {
+        assert!(!rendered(100, 32).contains("RPC ACTIVITY"));
+        assert!(rendered(100, 33).contains("RPC ACTIVITY"));
+    }
+
+    /// At 80x24 there is no room for both the panel and the feed. The feed is what gives way: a
+    /// missing panel is visibly missing, whereas a cropped metric line reads as a smaller number.
+    #[test]
+    fn a_short_terminal_drops_the_feed_rather_than_a_metric_line() {
+        let screen = rendered(80, 24);
+        for expected in ["MEMORY RSS", "REORGS", "DISK", "RPC HEALTH"] {
+            assert!(
+                screen.contains(expected),
+                "{expected:?} cropped at 80x24:\n{screen}"
+            );
+        }
+        assert!(
+            !screen.contains("LIVE EVENT FEED"),
+            "the feed should have given way at 80x24:\n{screen}"
+        );
+    }
 
     #[test]
     fn prometheus_parser_keeps_plain_metrics_only() {
@@ -914,6 +1083,15 @@ mod tests {
     #[test]
     fn cpu_percent_formats_one_decimal() {
         assert_eq!(format_cpu_percent(Some(Some(12.34))), "12.3%");
+    }
+
+    /// A nest that has sealed nothing occupies no bytes. That is a measurement, and saying
+    /// `unavailable` instead would be the same misreport the panel exists to avoid.
+    #[test]
+    fn zero_bytes_is_a_measurement_and_absence_is_not() {
+        assert_eq!(format_optional_bytes(Some(0)), "0 B");
+        assert_eq!(format_optional_bytes(Some(512)), "512 B");
+        assert_eq!(format_optional_bytes(None), "unavailable");
     }
 
     #[test]
@@ -984,8 +1162,8 @@ mod tests {
         );
         // (1.5274509169999997 + 13.819300575999996) / (35 + 186) * 1000 ≈ 69.5 ms
         assert_eq!(format_rpc_latency(rpc_latency_ms(&metrics)), "69 ms avg");
-        // Nuthatch's CPU sampler is Linux-only (nightswatchhq/nuthatch#844); on this macOS capture
-        // the counter is present but pinned at 0.0 — a real value, not a missing one.
+        // v2.7.1's CPU sampler was Linux-only (nightswatchhq/nuthatch#844), so on this macOS
+        // capture the counter is present but pinned at 0.0: a real value, not a missing one.
         assert_eq!(
             metrics.get("nuthatch_process_cpu_seconds_total"),
             Some(&0.0)
