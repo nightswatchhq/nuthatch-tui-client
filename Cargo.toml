@@ -2,6 +2,16 @@
 name = "nuthatch-tui-client"
 version = "0.1.0"
 edition = "2024"
+# Measured, not asserted: 1.85 is what edition 2024 needs, but `cargo +1.85.0 check` fails outright
+# because the locked tree wants more - darling 0.24 and instability 0.3 need 1.88, icu_* 2.3 needs
+# 1.88, idna_adapter 1.2 needs 1.86. 1.88.0 builds all targets and passes the suite, so 1.88 is the
+# lowest version this can honestly claim. CI holds it to that; lowering it needs a green build on
+# the lower toolchain, not an optimistic edit here.
+rust-version = "1.88"
+description = "A fast, read-only terminal dashboard for a running Nuthatch nest."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nightswatchhq/nuthatch-tui-client"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"

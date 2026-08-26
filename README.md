@@ -1,5 +1,7 @@
 # Nuthatch TUI Client
 
+[![CI](https://github.com/nightswatchhq/nuthatch-tui-client/actions/workflows/ci.yml/badge.svg)](https://github.com/nightswatchhq/nuthatch-tui-client/actions/workflows/ci.yml)
+
 A fast, read-only terminal dashboard for a running [Nuthatch](https://github.com/nightswatchhq/nuthatch) nest.
 
 `nuthatch-tui-client` turns the Nuthatch HTTP API into an operator view: whether the nest is live, how far it is behind, which data it has collected, what has been sealed, and how many outbound RPC requests the indexer has made since it started.
@@ -53,7 +55,7 @@ The RPC counter is Nuthatch's own `nuthatch_rpc_requests_total` metric. It reset
 
 ## Requirements
 
-- Rust 1.85 or newer.
+- Rust 1.88 or newer. Edition 2024 alone would settle for 1.85, but the locked dependency tree does not: `darling`, `instability` and the `icu_*` crates each want 1.88. CI builds on the declared floor so that sentence stays true.
 - A running Nuthatch API, normally started with `nuthatch dev`.
 - A terminal with colour and Unicode support. 100 columns by 30 rows shows every panel at once; see [Terminal size](#terminal-size) for what gives way below that.
 
@@ -171,13 +173,16 @@ line off the right-hand edge until the terminal is wider.
 ## Development
 
 ```sh
-cargo fmt --check
-cargo test
-cargo clippy -- -D warnings
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
+
+These are the three tasks `yatr ci` runs, and the three GitHub Actions runs on every push and pull
+request. A second CI job builds on the MSRV declared in `Cargo.toml`.
 
 The test suite covers Prometheus parsing, metric formatting, and the panel layout, the last by rendering the whole dashboard into a `TestBackend` at several terminal sizes and asserting that no metric line has been cropped. The HTTP contract and the terminal lifecycle are not covered by tests: to exercise those, start a local nest and run the client against its listener URL.
 
 ## Licence
 
-Dual-licensed under MIT or Apache-2.0, matching Nuthatch.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option, matching Nuthatch.

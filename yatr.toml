@@ -24,18 +24,18 @@ sources = ["**/*.rs"]
 
 [tasks.lint]
 desc = "Clippy with warnings denied"
-run = ["cargo clippy --all-targets -- -D warnings"]
+run = ["cargo clippy --all-targets --locked -- -D warnings"]
 sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock"]
 
 [tasks.test]
 desc = "Run the test suite"
-run = ["cargo test"]
+run = ["cargo test --locked"]
 sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock"]
 watch = ["**/*.rs"]
 
 [tasks.build]
 desc = "Build in release mode"
-run = ["cargo build --release"]
+run = ["cargo build --release --locked"]
 sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock"]
 
 [tasks.doc]
