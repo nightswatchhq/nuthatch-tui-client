@@ -491,10 +491,14 @@ fn format_rate(value: f64, unit: &str) -> String {
 /// bytes, and saying `unavailable` would be the same misreport in the other direction. Absence is
 /// `format_optional_bytes`'s job.
 fn format_bytes(value: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
     match value {
-        value if value < 1024 => format!("{value} B"),
-        value if value < 1024 * 1024 => format!("{} KiB", value / 1024),
-        value => format!("{:.1} MiB", value as f64 / (1024.0 * 1024.0)),
+        value if value < KIB => format!("{value} B"),
+        value if value < MIB => format!("{} KiB", value / KIB),
+        value if value < GIB => format!("{:.1} MiB", value as f64 / MIB as f64),
+        value => format!("{:.1} GiB", value as f64 / GIB as f64),
     }
 }
 
@@ -1083,6 +1087,15 @@ mod tests {
     #[test]
     fn cpu_percent_formats_one_decimal() {
         assert_eq!(format_cpu_percent(Some(Some(12.34))), "12.3%");
+    }
+
+    /// A live staking nest on arbitrum-one reported 1261.9 MiB of resident memory, which is one
+    /// rung above where this ladder used to stop.
+    #[test]
+    fn bytes_climb_past_a_gibibyte() {
+        assert_eq!(format_bytes(1_020 * 1024 * 1024), "1020.0 MiB");
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GiB");
+        assert_eq!(format_bytes(1_323_205_427), "1.2 GiB");
     }
 
     /// A nest that has sealed nothing occupies no bytes. That is a measurement, and saying
