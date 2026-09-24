@@ -101,11 +101,43 @@ struct Tables {
     tables: Vec<EventTable>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 struct EventTable {
     table: String,
     #[serde(default)]
     columns: Vec<Column>,
+    #[serde(default)]
+    alias: String,
+    /// `call` for a table of `eth_call` results rather than decoded events.
+    #[serde(default)]
+    kind: String,
+    selector: Option<String>,
+}
+
+impl EventTable {
+    fn is_call(&self) -> bool {
+        self.kind == "call"
+    }
+
+    /// The heading the table is listed under. State calls each have an alias of their own, so they
+    /// go together under one heading rather than a heading apiece.
+    fn group(&self) -> &str {
+        if self.is_call() {
+            "calls"
+        } else if !self.alias.is_empty() {
+            &self.alias
+        } else {
+            self.table.split_once("__").map_or("", |(alias, _)| alias)
+        }
+    }
+
+    /// The name as listed under its heading, which already says the alias.
+    fn short_name(&self) -> &str {
+        self.table
+            .strip_prefix(self.group())
+            .and_then(|rest| rest.strip_prefix("__"))
+            .unwrap_or(&self.table)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -139,14 +171,19 @@ struct SelectionQuery {
 
 impl SelectionQuery {
     fn new(table: &EventTable, limit: usize) -> Self {
+        let mut columns: Vec<String> = table
+            .columns
+            .iter()
+            .filter(|column| column.sol_type != "implicit")
+            .map(|column| column.name.clone())
+            .collect();
+        if table.is_call() {
+            // What the call returned is the point; the calldata is the same on every row.
+            columns.sort_by_key(|name| name != "result");
+        }
         Self {
             table: table.table.clone(),
-            columns: table
-                .columns
-                .iter()
-                .filter(|column| column.sol_type != "implicit")
-                .map(|column| column.name.clone())
-                .collect(),
+            columns,
             has_log_index: table.columns.is_empty()
                 || table
                     .columns
@@ -796,17 +833,30 @@ impl App {
     }
 
     /// Indices into the full table list of the tables the filter lets through.
+    /// Indices into the full table list of the tables the filter lets through, grouped under
+    /// their headings in the order each heading first appears.
     fn visible_tables(&self) -> Vec<usize> {
         let filter = self.filter.to_lowercase();
-        self.identity
+        let tables = self
+            .identity
             .as_ref()
             .map(|identity| identity.tables.tables.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-            .filter(|(_, table)| table.table.to_lowercase().contains(&filter))
-            .map(|(index, _)| index)
-            .collect()
+            .unwrap_or_default();
+        let mut groups: Vec<&str> = Vec::new();
+        for table in tables {
+            if !groups.contains(&table.group()) {
+                groups.push(table.group());
+            }
+        }
+        let mut visible: Vec<usize> = (0..tables.len())
+            .filter(|index| tables[*index].table.to_lowercase().contains(&filter))
+            .collect();
+        visible.sort_by_key(|index| {
+            groups
+                .iter()
+                .position(|group| *group == tables[*index].group())
+        });
+        visible
     }
 
     fn visible_position(&self) -> Option<usize> {
@@ -1914,6 +1964,41 @@ fn format_value(value: &Value) -> String {
     }
 }
 
+/// A state call's `result` is the raw return data. One 32-byte word is how every uint getter
+/// answers, so that shape is read as the number it is; anything else stays hex.
+fn is_abi_word(text: &str) -> bool {
+    text.strip_prefix("0x")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn word_to_decimal(word: &str) -> String {
+    // Little-endian base-10 digits, grown one nibble at a time.
+    let mut digits = vec![0u8];
+    for nibble in word[2..].chars().filter_map(|c| c.to_digit(16)) {
+        let mut carry = nibble;
+        for digit in &mut digits {
+            let value = u32::from(*digit) * 16 + carry;
+            *digit = (value % 10) as u8;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    let text: String = digits
+        .iter()
+        .rev()
+        .map(|digit| char::from(b'0' + digit))
+        .collect();
+    let trimmed = text.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".into()
+    } else {
+        trimmed.into()
+    }
+}
+
 fn is_decimal(text: &str) -> bool {
     let digits = text.strip_prefix('-').unwrap_or(text);
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
@@ -2006,6 +2091,13 @@ fn feed_lines(
         let cells: Vec<String> = rows
             .iter()
             .map(|row| match (row.get(name), scale) {
+                (Some(Value::String(word)), scale) if name == "result" && is_abi_word(word) => {
+                    let value = word_to_decimal(word);
+                    scale.map_or_else(
+                        || format_decimal(&value),
+                        |scale| format_scaled(&value, scale),
+                    )
+                }
                 (Some(Value::String(text)), Some(scale)) if is_decimal(text) => {
                     format_scaled(text, scale)
                 }
@@ -2283,16 +2375,32 @@ fn draw(frame: &mut Frame, app: &App) {
         .map(|identity| identity.tables.tables.as_slice())
         .unwrap_or_default();
     let visible = app.visible_tables();
-    let rows: Vec<ListItem> = visible
-        .iter()
-        .map(|index| {
-            ListItem::new(tables[*index].table.as_str()).style(Style::default().fg(Color::White))
-        })
-        .collect();
+    let mut rows: Vec<ListItem> = Vec::new();
+    let mut selected_row = None;
+    for (position, index) in visible.iter().enumerate() {
+        let group = tables[*index].group();
+        if position == 0 || tables[visible[position - 1]].group() != group {
+            let count = visible
+                .iter()
+                .filter(|index| tables[**index].group() == group)
+                .count();
+            rows.push(
+                ListItem::new(format!("{group} ({count})"))
+                    .style(Style::default().fg(Color::Gray).bold()),
+            );
+        }
+        if *index == app.selected_table {
+            selected_row = Some(rows.len());
+        }
+        rows.push(
+            ListItem::new(format!("  {}", tables[*index].short_name()))
+                .style(Style::default().fg(Color::White)),
+        );
+    }
     let position = app.visible_position();
     let mut list_state = ListState::default()
         .with_offset(app.table_offset.get())
-        .with_selected(position);
+        .with_selected(selected_row);
     let filter = match (app.filtering, app.filter.is_empty()) {
         (true, _) => format!("  /{}▏", app.filter),
         (false, false) => format!("  /{}", app.filter),
@@ -2474,7 +2582,16 @@ fn draw(frame: &mut Frame, app: &App) {
         ],
     };
     let summary = Paragraph::new(summary_lines)
-        .block(panel("SELECTED TABLE"))
+        .block(panel(&match identity
+            .and_then(|identity| identity.tables.tables.get(app.selected_table))
+            .filter(|table| table.is_call())
+        {
+            Some(table) => format!(
+                "SELECTED TABLE  eth_call {}",
+                table.selector.as_deref().unwrap_or("")
+            ),
+            None => "SELECTED TABLE".to_owned(),
+        }))
         .wrap(Wrap { trim: true });
     frame.render_widget(summary, left[1]);
 
@@ -2651,11 +2768,11 @@ mod tests {
                 tables: vec![
                     EventTable {
                         table: "usdc__approval".into(),
-                        columns: Vec::new(),
+                        ..EventTable::default()
                     },
                     EventTable {
                         table: "usdc__transfer".into(),
-                        columns: Vec::new(),
+                        ..EventTable::default()
                     },
                 ],
             },
@@ -2896,10 +3013,10 @@ mod tests {
             })
         };
         assert!(
-            reversed("usdc__approval"),
+            reversed("  approval"),
             "the selected table lost its highlight"
         );
-        assert!(!reversed("usdc__transfer"));
+        assert!(!reversed("  transfer"));
     }
 
     fn with_many_tables(count: usize) -> App {
@@ -2910,7 +3027,7 @@ mod tests {
             tables: (0..count)
                 .map(|index| EventTable {
                     table: format!("graph__table_{index:03}"),
-                    columns: Vec::new(),
+                    ..EventTable::default()
                 })
                 .collect(),
         };
@@ -2966,11 +3083,118 @@ mod tests {
                 .iter()
                 .map(|name| EventTable {
                     table: (*name).into(),
-                    columns: Vec::new(),
+                    ..EventTable::default()
                 })
                 .collect(),
         };
         app
+    }
+
+    fn grouped_nest() -> App {
+        let mut app = with_many_tables(0);
+        let tables: Vec<EventTable> = serde_json::from_str(
+            r#"[{"table":"curation__burned","alias":"curation"},
+                {"table":"staking__stake_deposited","alias":"staking"},
+                {"table":"total_supply","alias":"total_supply","kind":"call","selector":"0x18160ddd"},
+                {"table":"curation__signalled","alias":"curation"},
+                {"table":"issuance_per_block","alias":"issuance_per_block","kind":"call","selector":"0x0c0b9f9c"}]"#,
+        )
+        .unwrap();
+        app.identity.as_mut().unwrap().tables = Tables {
+            count: tables.len(),
+            tables,
+        };
+        app
+    }
+
+    #[test]
+    fn tables_are_listed_under_their_alias_and_calls_together() {
+        let mut app = grouped_nest();
+        assert_eq!(app.visible_tables(), [0, 3, 1, 2, 4]);
+        let screen = render(&app, 100, 30);
+        for expected in [
+            "curation (2)",
+            "  burned",
+            "  signalled",
+            "staking (1)",
+            "calls (2)",
+            "  total_supply",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+        }
+        // Navigation walks the grouped order and never lands on a heading.
+        let walked: Vec<String> = (0..5)
+            .filter_map(|_| app.select_next().map(|query| query.table))
+            .collect();
+        assert_eq!(
+            walked,
+            [
+                "curation__signalled",
+                "staking__stake_deposited",
+                "total_supply",
+                "issuance_per_block",
+                "curation__burned"
+            ]
+        );
+        app.selected_table = 2;
+        let screen = render(&app, 100, 30);
+        assert!(
+            screen.contains("SELECTED TABLE  eth_call 0x18160ddd"),
+            "{screen}"
+        );
+        press(&mut app, "/supply\n");
+        let screen = render(&app, 100, 30);
+        assert!(
+            screen.contains("calls (1)") && !screen.contains("curation (2)"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_heading_takes_the_alias_off_the_names_under_it() {
+        let table = |json| serde_json::from_str::<EventTable>(json).unwrap();
+        assert_eq!(
+            table(r#"{"table":"subgraph_service__allocation_closed","alias":"subgraph_service"}"#)
+                .short_name(),
+            "allocation_closed"
+        );
+        assert_eq!(
+            table(r#"{"table":"total_supply","alias":"total_supply","kind":"call"}"#).short_name(),
+            "total_supply"
+        );
+        assert_eq!(table(r#"{"table":"graph__x"}"#).short_name(), "x");
+    }
+
+    #[test]
+    fn a_call_result_is_read_as_the_number_it_encodes() {
+        let table: EventTable = serde_json::from_str(
+            r#"{"table":"total_supply","kind":"call","columns":[
+                {"name":"block_number","sol_type":"implicit"},{"name":"calldata","sol_type":"bytes"},
+                {"name":"result","sol_type":"bytes"},{"name":"reverted","sol_type":"bool"}]}"#,
+        )
+        .unwrap();
+        let query = SelectionQuery::new(&table, 6);
+        assert_eq!(query.columns, ["result", "calldata", "reverted"]);
+        assert_eq!(
+            word_to_decimal("0x00000000000000000000000000000000000000000052b7d2dcc80cd2e4000000"),
+            "100000000000000000000000000"
+        );
+        assert_eq!(word_to_decimal(&format!("0x{}", "0".repeat(64))), "0");
+        assert_eq!(
+            word_to_decimal(&format!("0x{}", "f".repeat(64))),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"block_number":508500000,"calldata":"0x18160ddd","reverted":false,
+                 "result":"0x00000000000000000000000000000000000000000052b7d2dcc80cd2e4000000"},
+                {"block_number":508400000,"calldata":"0x18160ddd","reverted":true,"result":"0x"}]"#,
+        )
+        .unwrap();
+        let decimals = BTreeMap::from([("total_supply.result".to_owned(), 18)]);
+        let lines = feed_lines(&rows, "total_supply", &query.columns, &decimals, 58);
+        assert_eq!(lines[0], "block        result       calldata    reverted");
+        assert_eq!(lines[1], "508,500,000  100,000,000  0x18160ddd  false");
+        assert_eq!(lines[2], "508,400,000  0x           0x18160ddd  true");
     }
 
     #[test]
@@ -3718,7 +3942,7 @@ mod tests {
     /// Prints the dashboard as drawn against a real nest, which is how the README's sample screen
     /// is made: `NUTHATCH_URL=http://127.0.0.1:18288 cargo test live -- --ignored --nocapture`.
     /// `NUTHATCH_SSH=host` goes through a forward, as `--ssh` does, and `NUTHATCH_NEST=name` takes
-    /// everything from `nests.toml`, as `--nest` does.
+    /// everything from `nests.toml`, as `--nest` does. `NUTHATCH_TABLE` selects a table by name.
     #[test]
     #[ignore = "needs a running nest at NUTHATCH_URL or NUTHATCH_NEST"]
     fn live() {
@@ -3747,7 +3971,18 @@ mod tests {
                 .map_or_else(|| url.clone(), |tunnel| tunnel.local_url.clone()),
         );
         app.decimals = target.decimals;
+        let table = std::env::var("NUTHATCH_TABLE").ok();
         for _ in 0..6 {
+            if let Some(index) = table.as_ref().and_then(|name| {
+                app.identity
+                    .as_ref()?
+                    .tables
+                    .tables
+                    .iter()
+                    .position(|t| t.table == *name)
+            }) {
+                app.selected_table = index;
+            }
             app.refresh(&client);
             std::thread::sleep(app.poll_interval());
         }
@@ -4023,7 +4258,7 @@ mod tests {
         for table in ["usdc__transfer", "usdc__approval", "usdc__transfer"] {
             let table = EventTable {
                 table: table.into(),
-                columns: Vec::new(),
+                ..EventTable::default()
             };
             requests
                 .send(Request::Selection(
@@ -4135,7 +4370,7 @@ mod tests {
         let query = SelectionQuery::new(
             &EventTable {
                 table: "usdc__approval".into(),
-                columns: Vec::new(),
+                ..EventTable::default()
             },
             6,
         );

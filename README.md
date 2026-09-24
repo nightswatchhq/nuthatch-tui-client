@@ -13,34 +13,34 @@ It is a client, not an indexer. It does not need an RPC key, open a store, alter
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ╭ NEST HEALTH ───────────────────╮╭ DATA COLLECTED ───────────────╮╭ SYNC POSITION ────────────────╮
 │ STATUS  READY                  ││ Tables          17            ││ █████████████████████████████ │
-│ Tip             26,049,133     ││ Decoded rows    21,203        ││ █████████████████████████████ │
-│ Indexed         26,049,133     ││ Sealed rows     20,004        ││ ███████████at tip ███████████ │
-│ Sealed          26,048,974     ││ Lag             0 blocks      ││ █████████████████████████████ │
-│ Seal gap        159            ││ Restarts        none seen     ││ █████████████████████████████ │
+│ Tip             26,049,246     ││ Decoded rows    7,394         ││ █████████████████████████████ │
+│ Indexed         26,049,245     ││ Sealed rows     0             ││ ████1 blocks · 10s behind ███ │
+│ Sealed          26,048,974     ││ Lag             1 blocks      ││ █████████████████████████████ │
+│ Seal gap        271            ││ Restarts        none seen     ││ █████████████████████████████ │
 ╰────────────────────────────────╯╰───────────────────────────────╯╰───────────────────────────────╯
 ╭ INDEXED TABLES  1/17  ↑↓ j k ──────╮╭ PERFORMANCE  rates warming 10/60s  (w) ────────────────────╮
-│ usdc__approval                     ││ RPC REQUESTS  2,700 since start  1.2 req/s  71 req/min     │
-│ usdc__authorization_canceled       ││ RPC METHODS     2,700 since start  1.2 calls/s             │
-│ usdc__authorization_used           ││ DECODED ROWS    21,203 since start  9.5 rows/s             │
-│ usdc__blacklisted                  ││ INDEXED BLOCKS  0.1 blocks/s  5.9 blocks/min               │
-│ usdc__blacklister_changed          ││ MEMORY RSS      181.9 MiB                                  │
-│ usdc__burn                         ││ API REFRESH     18 ms  poll 2s ago, every 2s               │
-│ usdc__master_minter_changed        ││ REORGS  0 since start   CPU  1.6%                          │
-│ usdc__mint                         ││ DISK            hot 32.6 MiB  sealed 2.9 MiB               │
-│ usdc__minter_configured            ││ RPC HEALTH      fail 1  retry 0  latency 82 ms avg         │
-│ usdc__minter_removed               ││ SQL QUERIES     71  rejected 0   OUTBOX 0                  │
-│ usdc__ownership_transferred        │╰────────────────────────────────────────────────────────────╯
-│ usdc__pause                        │╭ LIVE EVENT FEED ───────────────────────────────────────────╮
-│ usdc__pauser_changed               ││ block       owner        spender      value                │
-│ usdc__rescuer_changed              ││ 26,049,133  0x9602…c064  0x9edd…1224  1.15e77              │
-│ usdc__transfer                     ││ 26,049,133  0x9602…c064  0x9edd…1224  35,210,000           │
-│ usdc__un_blacklisted               ││ 26,049,133  0xb92f…ff4f  0xb92f…ff4f  35,210,000           │
-╰────────────────────────────────────╯│ 26,049,133  0x39f6…fa00  0x7777…834c  3,763,342            │
-╭ SELECTED TABLE ────────────────────╮│ 26,049,133  0x03b5…c38f  0x6a00…1068  0                    │
+│ usdc (17)                          ││ RPC REQUESTS  57 since start  1.0 req/s  60 req/min        │
+│   approval                         ││ RPC METHODS     57 since start  1.0 calls/s                │
+│   authorization_canceled           ││ DECODED ROWS    7,394 since start  0 rows/s                │
+│   authorization_used               ││ INDEXED BLOCKS  0 blocks/s  0 blocks/min                   │
+│   blacklisted                      ││ MEMORY RSS      143.9 MiB                                  │
+│   blacklister_changed              ││ API REFRESH     6 ms  poll 0s ago, every 2s                │
+│   burn                             ││ REORGS  0 since start   CPU  0.9%                          │
+│   master_minter_changed            ││ DISK            hot 32.6 MiB  sealed 2.9 MiB               │
+│   mint                             ││ RPC HEALTH      fail 0  retry 0  latency 103 ms avg        │
+│   minter_configured                ││ SQL QUERIES     10  rejected 0   OUTBOX 0                  │
+│   minter_removed                   │╰────────────────────────────────────────────────────────────╯
+│   ownership_transferred            │╭ LIVE EVENT FEED ───────────────────────────────────────────╮
+│   pause                            ││ block       owner        spender      value                │
+│   pauser_changed                   ││ 26,049,245  0xef9c…429f  0xb6d8…695b  1.00e17              │
+│   rescuer_changed                  ││ 26,049,245  0xb92f…ff4f  0x4cd0…bc31  239,865,017          │
+│   transfer                         ││ 26,049,245  0x9008…ab41  0xbbbb…ad5f  10,350,351,439       │
+╰────────────────────────────────────╯│ 26,049,245  0xb92f…ff4f  0x4cd0…bc31  393,698,316          │
+╭ SELECTED TABLE ────────────────────╮│ 26,049,245  0x8f10…f996  0xf6e7…3042  1.15e77              │
 │ usdc__approval                     │╰────────────────────────────────────────────────────────────╯
-│ Rows    9,557                      │╭ RPC / 2s  peak 4 ───────────╮╭ REFRESH / 2s  peak 81 ms ───╮
-│ Latest  26,049,133                 ││  █                          ││ ▁ █                         │
-│ Storage integrity: healthy         ││  █████                      ││ █▃█▂▂▃                      │
+│ Rows    10,753                     │╭ RPC / 2s  peak 2 ───────────╮╭ REFRESH / 2s  peak 70 ms ───╮
+│ Latest  26,049,245                 ││  █████                      ││ █                           │
+│ Storage integrity: healthy         ││  █████                      ││ █▁▃▁▁▁                      │
 ╰────────────────────────────────────╯╰─────────────────────────────╯╰─────────────────────────────╯
  q  quit   r  refresh   ↑↓  tables   w  window   /  filter  Live data received
 ```
@@ -52,10 +52,10 @@ It is a client, not an indexer. It does not need an RPC key, open a store, alter
 | **Nest health** | Is the indexer ready? What are the tip, indexed, and sealed block heights, and how far does the seal trail the index? During a seal-direct backfill, where the pass started. |
 | **Data collected** | How many event tables exist, rows decoded, rows sealed, blocks of lag, and how many Nuthatch restarts the client has seen while watching. |
 | **Sync position** | How far the cursor trails the tip, in blocks and in time. The fill measures that lag against the least the nest can be expected to trail by, one poll interval's worth of blocks or one block, whichever is more: full within it, half at twice it. During a backfill, the pass's progress instead. |
-| **Indexed tables** | The event tables exposed by the nest's schema, scrolled to keep the selection in view, with its position in the title. |
+| **Indexed tables** | The nest's tables, grouped under their contract's alias with the alias taken off each name, and every state-call table together under `calls`. Scrolled to keep the selection in view, with its position in the title. |
 | **Performance** | Rolling RPC request, RPC method, decoded-row, and indexed-block rates; lifetime counters; API refresh time; source-poll age; RSS; CPU utilisation; hot-store and sealed-segment disk footprint; RPC endpoint failures, retries, and average latency; reorg count; and SQL queries served and refused, with the alert outbox depth. The panel title carries the active rolling window; press `w` to choose 15, 60, or 90 seconds. |
 | **Selected table** | Row count and latest block for the selected event table, or a note that the nest has closed free-form SQL. |
-| **Live event feed** | The newest decoded rows for the selected table, as many as the panel has room for, as a table in the schema's column order. Columns are taken while they fit; addresses are shortened in the middle, and integers past fifteen digits turn scientific (`1.15e77`). Shows the nest's named queries instead when SQL is closed. Yields its space to the performance panel on a short terminal. |
+| **Live event feed** | The newest decoded rows for the selected table, as many as the panel has room for, as a table in the schema's column order. Columns are taken while they fit; addresses are shortened in the middle, and integers past fifteen digits turn scientific (`1.15e77`). A state call's `result` comes first and, when it is one 32-byte word as every uint getter returns, is shown as the number it encodes; the summary panel's title gives the call's selector. Shows the nest's named queries instead when SQL is closed. Yields its space to the performance panel on a short terminal. |
 | **RPC / API refresh** | Two sparklines: RPC requests and peak API refresh time, one bar per nest poll interval. Each title carries its own peak, since each bar is scaled to it. |
 
 The header leads with the nest's state. `● LIVE`, `● ATTENTION`, `● BACKFILL` and `● QUARANTINED` come from `/ready`, including the 503 body a stalled nest answers with. `(partial)` is added when the nest answered but some endpoint behind a panel did not; the footer names which. `● STALE` means `/ready` itself stopped answering and every number on screen is the last one received.
@@ -119,6 +119,7 @@ Nuthatch serves token amounts in base units and says nothing of their scale, so 
 [allocations.decimals]
 "curation__burned.tokens" = 18
 signal = 18
+"total_supply.result" = 18
 ```
 
 The feed then shows those columns in whole tokens, to four decimal places, truncated (`40.7288` rather than `4.07e19`); an amount too small to show reads `<0.0001`. Columns with no entry stay in base units, because a guessed scale would be a wrong number shown with confidence.
