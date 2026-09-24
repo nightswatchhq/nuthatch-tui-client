@@ -45,7 +45,7 @@ const ACTIVITY_LEN: usize = 64;
 const RECENT_RESTART: Duration = Duration::from_secs(600);
 /// Labelled metric lines in the performance panel. The panel is laid out at exactly this height so
 /// that none of them is silently cropped; raise it with the panel.
-const PERFORMANCE_LINES: u16 = 9;
+const PERFORMANCE_LINES: u16 = 10;
 const RATE_WINDOWS: [Duration; 3] = [
     Duration::from_secs(15),
     Duration::from_secs(60),
@@ -1755,18 +1755,31 @@ fn nest_name_from_schema(schema: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
+/// Labelled series of one family are summed, as RPC methods are across endpoints. A family that
+/// also publishes an unlabelled series is giving its total there and only breaking it down in the
+/// labelled ones, so adding the two would count everything twice.
 fn parse_prometheus(text: &str) -> BTreeMap<String, f64> {
-    text.lines()
+    let mut totals = BTreeMap::new();
+    let mut summed: BTreeMap<String, f64> = BTreeMap::new();
+    for line in text
+        .lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| {
-            let (name, value) = line.split_once(' ')?;
-            let name = name.split_once('{').map_or(name, |(name, _)| name);
-            Some((name.to_string(), value.parse::<f64>().ok()?))
-        })
-        .fold(BTreeMap::new(), |mut metrics, (name, value)| {
-            *metrics.entry(name).or_default() += value;
-            metrics
-        })
+    {
+        let Some((series, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let Ok(value) = value.parse::<f64>() else {
+            continue;
+        };
+        match series.split_once('{') {
+            Some((name, _)) => *summed.entry(name.to_owned()).or_default() += value,
+            None => {
+                totals.insert(series.to_owned(), value);
+            }
+        }
+    }
+    summed.extend(totals);
+    summed
 }
 
 fn metric_u64(metrics: &BTreeMap<String, f64>, name: &str) -> u64 {
@@ -2025,10 +2038,10 @@ fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(CANVAS)), area);
     let vertical = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(2),
         Constraint::Length(7),
         Constraint::Min(10),
-        Constraint::Length(3),
+        Constraint::Length(1),
     ])
     .split(area);
 
@@ -2293,6 +2306,25 @@ fn draw(frame: &mut Frame, app: &App) {
         ]),
         None => Line::from("RPC REQUESTS  unavailable"),
     };
+    let rejections = lifetime("nuthatch_sql_rejections_total");
+    let sql_line = Line::from(vec![
+        Span::raw(format!(
+            "SQL QUERIES     {}  ",
+            format_optional_count(lifetime("nuthatch_sql_queries_total"))
+        )),
+        Span::styled(
+            format!("rejected {}", format_optional_count(rejections)),
+            Style::default().fg(if rejections.is_some_and(|count| count > 0) {
+                Color::Yellow
+            } else {
+                Color::Reset
+            }),
+        ),
+        Span::raw(format!(
+            "   OUTBOX {}",
+            format_optional_count(lifetime("nuthatch_alert_outbox_depth"))
+        )),
+    ]);
     let activity = Paragraph::new(vec![
         rpc_line,
         Line::from(match lifetime("nuthatch_rpc_methods_total") {
@@ -2343,6 +2375,7 @@ fn draw(frame: &mut Frame, app: &App) {
             format_optional_count(lifetime("nuthatch_rpc_endpoint_retries_total")),
             format_rpc_latency(metrics.and_then(rpc_latency_ms)),
         )),
+        sql_line,
     ])
     .block(panel(&format!(
         "PERFORMANCE  rates {}  (w)",
@@ -2606,7 +2639,11 @@ mod tests {
              nuthatch_rpc_endpoint_failures_total 69\n\
              nuthatch_rpc_endpoint_retries_total 35\n\
              nuthatch_rpc_request_duration_seconds_sum 15.3\n\
-             nuthatch_rpc_request_duration_seconds_count 221\n",
+             nuthatch_rpc_request_duration_seconds_count 221\n\
+             nuthatch_sql_queries_total 1204\n\
+             nuthatch_sql_rejections_total 6\n\
+             nuthatch_sql_rejections_total{reason=\"busy\"} 6\n\
+             nuthatch_alert_outbox_depth 0\n",
         ));
         app.selection = Some(Selection {
             table: "usdc__approval".into(),
@@ -2671,6 +2708,7 @@ mod tests {
             "REORGS  0 since start   CPU  ",
             "DISK            hot 2.0 MiB  sealed 47 KiB",
             "RPC HEALTH      fail 69  retry 35  latency 69 ms avg",
+            "SQL QUERIES     1,204  rejected 6   OUTBOX 0",
         ] {
             assert!(
                 screen.contains(expected),
@@ -2763,9 +2801,9 @@ mod tests {
     /// The sparkline is the last thing to arrive, and the README quotes the height at which it
     /// does. Asserting the boundary keeps that sentence honest.
     #[test]
-    fn the_sparkline_arrives_at_thirty_three_rows() {
-        assert!(!rendered(100, 32).contains("REFRESH /"));
-        assert!(rendered(100, 33).contains("REFRESH /"));
+    fn the_sparkline_arrives_at_thirty_one_rows() {
+        assert!(!rendered(100, 30).contains("REFRESH /"));
+        assert!(rendered(100, 31).contains("REFRESH /"));
     }
 
     /// At 80x24 there is no room for both the panel and the feed. The feed is what gives way: a
@@ -2773,7 +2811,7 @@ mod tests {
     #[test]
     fn a_short_terminal_drops_the_feed_rather_than_a_metric_line() {
         let screen = rendered(80, 24);
-        for expected in ["MEMORY RSS", "REORGS", "DISK", "RPC HEALTH"] {
+        for expected in ["MEMORY RSS", "REORGS", "DISK", "RPC HEALTH", "SQL QUERIES"] {
             assert!(
                 screen.contains(expected),
                 "{expected:?} cropped at 80x24:\n{screen}"
@@ -3102,6 +3140,32 @@ mod tests {
              nuthatch_rpc_methods_total{method=\"eth_getBlockByNumber\"} 9\n",
         );
         assert_eq!(metrics.get("nuthatch_rpc_methods_total"), Some(&13.0));
+    }
+
+    /// Nuthatch 3.10 publishes SQL rejections as a total and again by reason.
+    #[test]
+    fn a_published_total_is_not_added_to_its_own_breakdown() {
+        let metrics = parse_prometheus(
+            "nuthatch_sql_rejections_total 6\n\
+             nuthatch_sql_rejections_total{reason=\"busy\"} 4\n\
+             nuthatch_sql_rejections_total{reason=\"too_large\"} 2\n\
+             nuthatch_rpc_methods_total{method=\"eth_getLogs\"} 4\n\
+             nuthatch_rpc_methods_total{method=\"eth_blockNumber\"} 9\n",
+        );
+        assert_eq!(metrics.get("nuthatch_sql_rejections_total"), Some(&6.0));
+        assert_eq!(metrics.get("nuthatch_rpc_methods_total"), Some(&13.0));
+    }
+
+    /// Twenty-two rows is the least that holds the performance panel whole.
+    #[test]
+    fn every_metric_line_survives_at_twenty_two_rows() {
+        let screen = rendered(80, 22);
+        for expected in ["RPC REQUESTS", "RPC HEALTH", "SQL QUERIES"] {
+            assert!(
+                screen.contains(expected),
+                "{expected:?} cropped at 80x22:\n{screen}"
+            );
+        }
     }
 
     #[test]
