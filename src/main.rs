@@ -241,6 +241,8 @@ struct NestDocument {
 struct RootDocument {
     #[serde(default)]
     name: String,
+    /// Rows in the nest's hot store: the `ENTITIES` table of its redb, not sealed history.
+    entities: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -378,6 +380,7 @@ struct PollResult {
     identity: Option<Result<Identity, Problem>>,
     ready: Result<Ready, String>,
     metrics: Result<BTreeMap<String, f64>, String>,
+    hot_rows: Result<Option<u64>, String>,
     table: Option<String>,
     selection: Option<Result<Selection, String>>,
     elapsed: Duration,
@@ -442,6 +445,7 @@ fn poll(client: &Client, request: &PollRequest) -> PollResult {
             identity: None,
             ready: Err("a runtime root".into()),
             metrics: Err("a runtime root".into()),
+            hot_rows: Err("a runtime root".into()),
             table: None,
             selection: None,
             elapsed: started.elapsed(),
@@ -452,6 +456,8 @@ fn poll(client: &Client, request: &PollRequest) -> PollResult {
         .as_ref()
         .map(|root| fetch_json::<Roster>(client, &format!("{root}/nests"), &[]));
     let ready = fetch_ready(client, base);
+    let hot_rows =
+        fetch_json::<RootDocument>(client, &format!("{base}/"), &[]).map(|root| root.entities);
     let metrics =
         fetch_ok(client, &format!("{base}/metrics"), &[]).map(|text| parse_prometheus(&text));
     let (query, sql_open) = match &identity {
@@ -483,6 +489,7 @@ fn poll(client: &Client, request: &PollRequest) -> PollResult {
         metrics,
         table,
         selection,
+        hot_rows,
         elapsed: started.elapsed(),
     }
 }
@@ -533,6 +540,7 @@ struct App {
     /// The last `/ready` failed, so `ready` is the previous answer and everything is stale.
     ready_failed: bool,
     metrics: Option<BTreeMap<String, f64>>,
+    hot_rows: Option<u64>,
     selection: Option<Selection>,
     problems: Vec<Problem>,
     samples: Vec<Sample>,
@@ -571,6 +579,7 @@ impl App {
             ready: None,
             ready_failed: false,
             metrics: None,
+            hot_rows: None,
             selection: None,
             problems: Vec::new(),
             samples: Vec::new(),
@@ -676,6 +685,13 @@ impl App {
             Ok(metrics) => Some(metrics),
             Err(error) => {
                 problems.push(("/metrics", error));
+                None
+            }
+        };
+        self.hot_rows = match result.hot_rows {
+            Ok(rows) => rows,
+            Err(error) => {
+                problems.push(("/", error));
                 None
             }
         };
@@ -802,6 +818,7 @@ impl App {
         self.ready = None;
         self.ready_failed = false;
         self.metrics = None;
+        self.hot_rows = None;
         self.selection = None;
         self.problems.clear();
         self.samples.clear();
@@ -1026,11 +1043,11 @@ impl App {
         });
         let label = match rate {
             Some(rate) => format!(
-                "{} blocks · {} behind",
-                group_digits(lag),
+                "{} · {} behind",
+                count_blocks(lag),
                 format_span(Duration::from_secs_f64(lag as f64 / rate))
             ),
-            None => format!("{} blocks behind", group_digits(lag)),
+            None => format!("{} behind", count_blocks(lag)),
         };
         ((step / lag as f64).min(1.0), label)
     }
@@ -1849,6 +1866,13 @@ fn metric_opt_u64(metrics: &BTreeMap<String, f64>, name: &str) -> Option<u64> {
     metrics.get(name).copied().map(|value| value as u64)
 }
 
+fn count_blocks(count: u64) -> String {
+    match count {
+        1 => "1 block".into(),
+        count => format!("{} blocks", group_digits(count)),
+    }
+}
+
 fn group_digits(value: u64) -> String {
     group_decimal(&value.to_string())
 }
@@ -2319,8 +2343,8 @@ fn draw(frame: &mut Frame, app: &App) {
             )
         )),
         Line::from(format!(
-            "Decoded rows    {}",
-            lifetime("nuthatch_rows_decoded_total")
+            "Hot rows        {}",
+            app.hot_rows
                 .map_or_else(|| "unavailable".into(), group_digits)
         )),
         Line::from(format!(
@@ -2330,9 +2354,7 @@ fn draw(frame: &mut Frame, app: &App) {
         )),
         Line::from(format!(
             "Lag             {}",
-            ready
-                .lag_blocks
-                .map_or_else(|| "—".into(), |lag| format!("{} blocks", group_digits(lag)))
+            ready.lag_blocks.map_or_else(|| "—".into(), count_blocks)
         )),
         Line::from(Span::styled(
             format!("Restarts        {restarts}"),
@@ -3310,6 +3332,13 @@ mod tests {
     }
 
     #[test]
+    fn one_block_is_singular() {
+        assert_eq!(count_blocks(1), "1 block");
+        assert_eq!(count_blocks(0), "0 blocks");
+        assert_eq!(count_blocks(331_434), "331,434 blocks");
+    }
+
+    #[test]
     fn the_gauge_without_a_measured_rate_counts_blocks() {
         let mut app = populated();
         app.samples.truncate(1);
@@ -4063,6 +4092,7 @@ mod tests {
     /// Trimmed from a live `nuthatch dev` 3.10.0 USDC nest on mainnet, 2026-09-24.
     const READY: &str = r#"{"cursorless":false,"entities_stalled":false,"freshness":{"mode":"tip","poll_interval_secs":2},"initial_poll_failed":false,"lag_blocks":0,"last_block":26048483,"ready":true,"seal_direct_active":false,"seal_direct_completed":0,"seal_direct_origin":0,"seal_direct_stalled":false,"seal_direct_target":0,"seal_lag_blocks":null,"sealed_through":0,"seconds_since_poll":2,"stalled":false,"tip":26048483,"version":"3.10.0","wedged":false}"#;
     const METRICS: &str = "nuthatch_rows_decoded_total 10511\nnuthatch_rpc_requests_total 57\n";
+    const ROOT: &str = r#"{"name":"nuthatch","chain":"mainnet","entities":5705,"last_block":"26048483","tables":2}"#;
     const TABLES: &str =
         r#"{"count":2,"tables":[{"table":"usdc__approval"},{"table":"usdc__transfer"}]}"#;
     const NEST: &str = r#"{"chain":"mainnet","chain_id":1,"name":"demo-usdc","table_count":2}"#;
@@ -4073,6 +4103,7 @@ mod tests {
     fn healthy(target: &str) -> (u16, String) {
         let path = target.split('?').next().unwrap_or(target);
         let body = match path {
+            "/" => ROOT,
             "/ready" => READY,
             "/metrics" => METRICS,
             "/tables" => TABLES,
@@ -4107,6 +4138,7 @@ mod tests {
         assert_eq!(identity.nest_name.as_deref(), Some("demo-usdc"));
         assert_eq!(identity.chain.as_deref(), Some("mainnet"));
         assert_eq!(app.selection.as_ref().unwrap().rows, Some(2275));
+        assert_eq!(app.hot_rows, Some(5705));
     }
 
     #[test]
@@ -4174,7 +4206,11 @@ mod tests {
         assert_eq!(app.status(), "/metrics: HTTP 404 Not Found");
         let screen = render(&app, 100, 30);
         assert!(screen.contains("RPC REQUESTS  unavailable"), "{screen}");
-        assert!(screen.contains("Decoded rows    unavailable"), "{screen}");
+        assert!(screen.contains("DECODED ROWS    unavailable"), "{screen}");
+        assert!(
+            screen.contains("Hot rows        5,705"),
+            "the root document still answered:\n{screen}"
+        );
     }
 
     #[test]
