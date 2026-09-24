@@ -323,6 +323,10 @@ type Problem = (&'static str, String);
 /// A poll names the selected table rather than indexing it, so a catalogue refetched after a
 /// restart keeps the operator's place in it.
 struct PollRequest {
+    /// The nest this poll is for. A reply for a nest the operator has since left is dropped.
+    base: String,
+    /// A runtime's root, whose roster is refreshed with every poll so another nest's quarantine shows.
+    roster: Option<String>,
     identity: bool,
     selection: Option<SelectionQuery>,
     sql_open: bool,
@@ -330,6 +334,10 @@ struct PollRequest {
 }
 
 struct PollResult {
+    base: String,
+    /// Set when `base` turned out to be a runtime's root rather than a nest.
+    discovered: Option<Roster>,
+    roster: Option<Result<Roster, String>>,
     identity: Option<Result<Identity, Problem>>,
     ready: Result<Ready, String>,
     metrics: Result<BTreeMap<String, f64>, String>,
@@ -340,17 +348,72 @@ struct PollResult {
 
 enum Request {
     Poll(PollRequest),
-    Selection(SelectionQuery),
+    Selection(String, SelectionQuery),
 }
 
 enum Reply {
     Poll(Box<PollResult>),
-    Selection(Result<Selection, String>),
+    Selection(String, Result<Selection, String>),
 }
 
-fn poll(client: &Client, base: &str, request: &PollRequest) -> PollResult {
+/// `GET /nests` on a runtime: the nests it mounts, each serving its own API under `base_path`.
+#[derive(Debug, Deserialize, Clone, Default)]
+struct Roster {
+    #[serde(default)]
+    runtime: String,
+    nests: Vec<RosterNest>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RosterNest {
+    name: String,
+    #[serde(default)]
+    base_path: String,
+    #[serde(default)]
+    health: String,
+}
+
+impl RosterNest {
+    fn path(&self) -> String {
+        if self.base_path.is_empty() {
+            format!("/{}", self.name)
+        } else {
+            self.base_path.clone()
+        }
+    }
+}
+
+struct Runtime {
+    root: String,
+    roster: Roster,
+    current: usize,
+}
+
+fn poll(client: &Client, request: &PollRequest) -> PollResult {
     let started = Instant::now();
+    let base = request.base.as_str();
     let identity = request.identity.then(|| fetch_identity(client, base));
+    // A runtime's root has no catalogue of its own, only a roster of the nests it mounts, and a
+    // `/ready` with no heights in it that would decode as a ready nest at block zero.
+    if let Some(Err(("/tables", _))) = &identity
+        && let Ok(roster) = fetch_json::<Roster>(client, &format!("{base}/nests"), &[])
+    {
+        return PollResult {
+            base: base.to_owned(),
+            discovered: Some(roster),
+            roster: None,
+            identity: None,
+            ready: Err("a runtime root".into()),
+            metrics: Err("a runtime root".into()),
+            table: None,
+            selection: None,
+            elapsed: started.elapsed(),
+        };
+    }
+    let roster = request
+        .roster
+        .as_ref()
+        .map(|root| fetch_json::<Roster>(client, &format!("{root}/nests"), &[]));
     let ready = fetch_ready(client, base);
     let metrics =
         fetch_ok(client, &format!("{base}/metrics"), &[]).map(|text| parse_prometheus(&text));
@@ -375,6 +438,9 @@ fn poll(client: &Client, base: &str, request: &PollRequest) -> PollResult {
         .map(|query| fetch_selection(client, base, query));
     let table = query.map(|query| query.table);
     PollResult {
+        base: base.to_owned(),
+        discovered: None,
+        roster,
         identity,
         ready,
         metrics,
@@ -385,7 +451,7 @@ fn poll(client: &Client, base: &str, request: &PollRequest) -> PollResult {
 }
 
 /// Requests run here so that a slow `/sql` delays the numbers rather than the keyboard.
-fn spawn_worker(client: Client, base: String) -> (Sender<Request>, Receiver<Reply>) {
+fn spawn_worker(client: Client) -> (Sender<Request>, Receiver<Reply>) {
     let (requests, inbox) = mpsc::channel();
     let (outbox, replies) = mpsc::channel();
     std::thread::spawn(move || {
@@ -395,16 +461,16 @@ fn spawn_worker(client: Client, base: String) -> (Sender<Request>, Receiver<Repl
             for request in std::iter::once(first).chain(inbox.try_iter()) {
                 match request {
                     Request::Poll(request) => next_poll = Some(request),
-                    Request::Selection(table) => next_selection = Some(table),
+                    Request::Selection(base, query) => next_selection = Some((base, query)),
                 }
             }
             let replies = next_poll
-                .map(|request| Reply::Poll(Box::new(poll(&client, &base, &request))))
+                .map(|request| Reply::Poll(Box::new(poll(&client, &request))))
                 .into_iter()
-                .chain(
-                    next_selection
-                        .map(|table| Reply::Selection(fetch_selection(&client, &base, &table))),
-                );
+                .chain(next_selection.map(|(base, query)| {
+                    let result = fetch_selection(&client, &base, &query);
+                    Reply::Selection(base, result)
+                }));
             for reply in replies {
                 if outbox.send(reply).is_err() {
                     return;
@@ -445,6 +511,8 @@ struct App {
     refresh_time: Option<Duration>,
     last_refresh: Option<Instant>,
     poll_in_flight: bool,
+    /// Set when the URL given was a runtime's root; `url` is then the mounted nest being shown.
+    runtime: Option<Runtime>,
     /// Narrows the table list to names containing it, case-insensitively.
     filter: String,
     /// Keys are going into the filter rather than driving the dashboard.
@@ -478,6 +546,7 @@ impl App {
             refresh_time: None,
             last_refresh: None,
             poll_in_flight: false,
+            runtime: None,
             filter: String::new(),
             filtering: false,
             should_quit: false,
@@ -493,6 +562,8 @@ impl App {
 
     fn poll_request(&self) -> PollRequest {
         PollRequest {
+            base: self.url.clone(),
+            roster: self.runtime.as_ref().map(|runtime| runtime.root.clone()),
             identity: self.identity.is_none() || self.refetch_identity,
             selection: self.selection_query(),
             sql_open: self
@@ -515,7 +586,24 @@ impl App {
 
     fn apply(&mut self, result: PollResult) {
         self.poll_in_flight = false;
+        if result.base != self.url {
+            return;
+        }
+        if let Some(roster) = result.discovered {
+            self.runtime = Some(Runtime {
+                root: self.url.clone(),
+                roster,
+                current: 0,
+            });
+            self.switch_nest(0);
+            return;
+        }
         let mut problems = Vec::new();
+        match (result.roster, self.runtime.as_mut()) {
+            (Some(Ok(roster)), Some(runtime)) => runtime.roster = roster,
+            (Some(Err(error)), Some(_)) => problems.push(("/nests", error)),
+            _ => {}
+        }
         match result.identity {
             Some(Ok(identity)) => {
                 self.selected_table = result
@@ -568,7 +656,10 @@ impl App {
         self.last_refresh = Some(Instant::now());
     }
 
-    fn apply_selection(&mut self, result: Result<Selection, String>) {
+    fn apply_selection(&mut self, base: &str, result: Result<Selection, String>) {
+        if base != self.url {
+            return;
+        }
         self.problems.retain(|(endpoint, _)| *endpoint != "/sql");
         match result {
             Ok(selection) => self.selection = Some(selection),
@@ -654,6 +745,52 @@ impl App {
             .as_ref()
             .filter(|identity| identity.sql == SqlAccess::Open)?;
         self.selection_query()
+    }
+
+    /// Shows another of a runtime's nests. Everything the dashboard holds belonged to the nest being
+    /// left, so it starts again from nothing rather than blending two nests' counters.
+    fn switch_nest(&mut self, index: usize) {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        let Some(nest) = runtime.roster.nests.get(index) else {
+            return;
+        };
+        runtime.current = index;
+        self.url = format!("{}{}", runtime.root, nest.path());
+        self.identity = None;
+        self.refetch_identity = false;
+        self.ready = None;
+        self.ready_failed = false;
+        self.metrics = None;
+        self.selection = None;
+        self.problems.clear();
+        self.samples.clear();
+        self.activity = Activity::default();
+        self.restarts = 0;
+        self.last_restart = None;
+        self.selected_table = 0;
+        self.table_offset.set(0);
+        self.filter.clear();
+        self.filtering = false;
+        self.refresh_time = None;
+        self.last_refresh = None;
+    }
+
+    fn cycle_nest(&mut self, forward: bool) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        let count = runtime.roster.nests.len();
+        if count < 2 {
+            return;
+        }
+        let next = if forward {
+            (runtime.current + 1) % count
+        } else {
+            (runtime.current + count - 1) % count
+        };
+        self.switch_nest(next);
     }
 
     /// Indices into the full table list of the tables the filter lets through.
@@ -765,6 +902,14 @@ impl App {
             }
             KeyCode::Char('w') => {
                 self.cycle_rate_window();
+                None
+            }
+            KeyCode::Char('n') => {
+                self.cycle_nest(true);
+                None
+            }
+            KeyCode::Char('N') => {
+                self.cycle_nest(false);
                 None
             }
             KeyCode::Char('j') => self.select_next(),
@@ -1328,7 +1473,7 @@ fn run<B: Backend>(
     mut tunnel: Option<Tunnel>,
     quit: &AtomicBool,
 ) -> Result<()> {
-    let (requests, replies) = spawn_worker(client, app.url.clone());
+    let (requests, replies) = spawn_worker(client);
     let send = |request| {
         requests
             .send(request)
@@ -1341,7 +1486,7 @@ fn run<B: Backend>(
         for reply in replies.try_iter() {
             match reply {
                 Reply::Poll(result) => app.apply(*result),
-                Reply::Selection(result) => app.apply_selection(result),
+                Reply::Selection(base, result) => app.apply_selection(&base, result),
             }
         }
         if app.refresh_due() {
@@ -1356,7 +1501,7 @@ fn run<B: Backend>(
         {
             let query = app.handle_key(key);
             if let Some(table) = query {
-                send(Request::Selection(table))?;
+                send(Request::Selection(app.url.clone(), table))?;
             }
         }
         if app.should_quit || quit.load(Ordering::Relaxed) {
@@ -1806,6 +1951,29 @@ fn draw(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::Cyan).bold(),
         ),
     ];
+    if let Some(runtime) = &app.runtime {
+        header.push(Span::styled(
+            format!(
+                "  {} {}/{}",
+                runtime.roster.runtime,
+                runtime.current + 1,
+                runtime.roster.nests.len()
+            ),
+            Style::default().fg(Color::Gray),
+        ));
+        let quarantined = runtime
+            .roster
+            .nests
+            .iter()
+            .filter(|nest| nest.health == "quarantined")
+            .count();
+        if quarantined > 0 {
+            header.push(Span::styled(
+                format!("  {quarantined} quarantined"),
+                Style::default().fg(Color::Red).bold(),
+            ));
+        }
+    }
     if let Some(chain) = identity.and_then(|identity| identity.chain.as_deref()) {
         header.push(Span::styled(
             format!("  {chain}"),
@@ -2172,7 +2340,7 @@ fn draw(frame: &mut Frame, app: &App) {
         }
     }
 
-    let footer = Paragraph::new(Line::from(vec![
+    let mut footer = vec![
         Span::styled(
             " q ",
             Style::default().fg(Color::Black).bg(Color::Gray).bold(),
@@ -2198,16 +2366,23 @@ fn draw(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::Black).bg(Color::Gray).bold(),
         ),
         Span::raw(" filter  "),
-        Span::styled(
-            app.status(),
-            Style::default().fg(if app.problems.is_empty() {
-                Color::DarkGray
-            } else {
-                Color::Yellow
-            }),
-        ),
-    ]));
-    frame.render_widget(footer, vertical[3]);
+    ];
+    if app.runtime.is_some() {
+        footer.push(Span::styled(
+            " n ",
+            Style::default().fg(Color::Black).bg(Color::Gray).bold(),
+        ));
+        footer.push(Span::raw(" nest  "));
+    }
+    footer.push(Span::styled(
+        app.status(),
+        Style::default().fg(if app.problems.is_empty() {
+            Color::DarkGray
+        } else {
+            Color::Yellow
+        }),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(footer)), vertical[3]);
 
     if app.no_color {
         strip_colour(frame.buffer_mut());
@@ -3249,12 +3424,13 @@ mod tests {
         fn refresh(&mut self, client: &Client) {
             let request = self.poll_request();
             self.poll_in_flight = true;
-            self.apply(poll(client, &self.url, &request));
+            self.apply(poll(client, &request));
         }
 
         fn query(&mut self, client: &Client, query: Option<SelectionQuery>) {
             if let Some(query) = query {
-                self.apply_selection(fetch_selection(client, &self.url, &query));
+                let base = self.url.clone();
+                self.apply_selection(&base, fetch_selection(client, &base, &query));
             }
         }
     }
@@ -3491,9 +3667,11 @@ mod tests {
             }
             healthy(target)
         });
-        let (requests, replies) = spawn_worker(Client::new(), nest.base.clone());
+        let (requests, replies) = spawn_worker(Client::new());
         requests
             .send(Request::Poll(PollRequest {
+                base: nest.base.clone(),
+                roster: None,
                 identity: true,
                 selection: None,
                 sql_open: true,
@@ -3506,12 +3684,16 @@ mod tests {
                 columns: Vec::new(),
             };
             requests
-                .send(Request::Selection(SelectionQuery::new(&table, 6)))
+                .send(Request::Selection(
+                    nest.base.clone(),
+                    SelectionQuery::new(&table, 6),
+                ))
                 .unwrap();
         }
         let first = replies.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(first, Reply::Poll(_)));
-        let Reply::Selection(Ok(selection)) = replies.recv_timeout(Duration::from_secs(5)).unwrap()
+        let Reply::Selection(_, Ok(selection)) =
+            replies.recv_timeout(Duration::from_secs(5)).unwrap()
         else {
             panic!("expected a selection reply");
         };
@@ -3536,6 +3718,88 @@ mod tests {
         assert_eq!(nest.hits("/tables"), 2);
         assert_eq!(app.selected_table_name(), Some("usdc__transfer"));
         assert_eq!(app.selection.as_ref().unwrap().table, "usdc__transfer");
+    }
+
+    /// A runtime's root, answering the way `nuthatch dev` over a `mounts.toml` does in 3.10.0.
+    fn runtime(target: &str) -> (u16, String) {
+        match target {
+            "/nests" => (
+                200,
+                r#"{"runtime":"demo-runtime","nests":[
+                    {"name":"usdc","base_path":"/usdc","health":"indexing"},
+                    {"name":"weth","base_path":"/weth","health":"quarantined"}]}"#
+                    .into(),
+            ),
+            "/ready" => (
+                200,
+                r#"{"quarantined":[],"ready":true,"stalled":[],"version":"3.10.0"}"#.into(),
+            ),
+            "/weth/queries" => (
+                200,
+                r#"{"free_form":false,"queries":[],"sql":"deny"}"#.into(),
+            ),
+            _ => match target
+                .split_once('/')
+                .and_then(|(_, rest)| rest.split_once('/'))
+            {
+                Some(("usdc" | "weth", rest)) => healthy(&format!("/{rest}")),
+                _ => (404, "not found".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn a_runtime_root_is_recognised_and_its_nests_can_be_walked() {
+        let nest = TestNest::serve(runtime);
+        let (mut app, client) = nest.app();
+        app.refresh(&client);
+        let runtime = app.runtime.as_ref().expect("the roster was found");
+        assert_eq!(runtime.roster.runtime, "demo-runtime");
+        assert_eq!(app.url, format!("{}/usdc", nest.base));
+        assert!(app.ready.is_none(), "the root's /ready is not a nest's");
+        app.refresh(&client);
+        assert_eq!(app.state().0, "● LIVE");
+        assert_eq!(app.selection.as_ref().unwrap().rows, Some(2275));
+        let screen = render(&app, 100, 30);
+        assert!(
+            screen.contains("demo-runtime 1/2  1 quarantined"),
+            "{screen}"
+        );
+        assert!(screen.contains(" n  nest"), "{screen}");
+
+        press(&mut app, "n");
+        assert_eq!(app.url, format!("{}/weth", nest.base));
+        assert!(app.identity.is_none() && app.samples.is_empty() && app.selection.is_none());
+        app.refresh(&client);
+        assert!(matches!(
+            app.identity.as_ref().unwrap().sql,
+            SqlAccess::Closed { .. }
+        ));
+        press(&mut app, "N");
+        assert_eq!(app.url, format!("{}/usdc", nest.base));
+    }
+
+    /// A poll that was already in flight when the operator switched nests must not be drawn over the
+    /// nest they switched to.
+    #[test]
+    fn a_reply_for_a_nest_already_left_is_dropped() {
+        let nest = TestNest::serve(runtime);
+        let (mut app, client) = nest.app();
+        app.refresh(&client);
+        let stale = poll(&client, &app.poll_request());
+        press(&mut app, "n");
+        app.apply(stale);
+        assert!(app.ready.is_none() && app.identity.is_none());
+        let query = SelectionQuery::new(
+            &EventTable {
+                table: "usdc__approval".into(),
+                columns: Vec::new(),
+            },
+            6,
+        );
+        let usdc = format!("{}/usdc", nest.base);
+        app.apply_selection(&usdc, fetch_selection(&client, &usdc, &query));
+        assert!(app.selection.is_none());
     }
 
     #[test]

@@ -110,6 +110,10 @@ url = "http://127.0.0.1:18288"
 
 and opened with `--nest allocations`. `--url` and `--ssh` given alongside it take precedence over the entry.
 
+### Runtimes
+
+Pointed at the root of a runtime (`nuthatch dev` over a `mounts.toml`), the client finds the roster at `/nests` and opens the first mounted nest under its prefix. `n` and `N` step through the others; each switch starts the dashboard afresh, because counters and rates belong to one nest. The header names the runtime, which nest is showing, and how many of its nests are quarantined. A runtime's root `/ready` carries no heights, so it is never read as a nest's.
+
 For an optimised build:
 
 ```sh
@@ -124,6 +128,7 @@ cargo run --release -- --url http://127.0.0.1:8288
 | `Up` / `Down` or `k` / `j` | Select an event table and refresh its summary and event feed. |
 | `PageUp` / `PageDown` | Move the selection ten tables. |
 | `Home` / `End` or `g` / `G` | Jump to the first or last table. |
+| `n` / `N` | On a runtime, show the next or previous mounted nest. |
 | `/` | Filter the table list by name, case-insensitively. `Enter` keeps the filter, `Esc` drops it; while typing, letters are text rather than commands. |
 | `w` | Cycle the rolling-rate window: 15, 60, or 90 seconds. |
 | `q`, `Esc` or `Ctrl-C` | Exit cleanly. With a filter standing, the first `Esc` clears it instead. |
@@ -161,6 +166,7 @@ The client uses only public, read-only Nuthatch endpoints:
 | `GET /sql?q=…` | Every refresh, and on changing the selection. A count, and the newest rows for the selected table by its decoded columns, all quoted as identifiers. Naming the columns leaves out the `_dec` and `_overflow` companions Nuthatch adds to every big integer for arithmetic; the plain column already holds the exact decimal text. Skipped entirely on a nest whose `/queries` says SQL is closed. |
 | `GET /tables`, `GET /nest`, `GET /queries` | Once, and again after a restart. The table catalogue, the nest's name and chain, and whether free-form SQL is open. Nuthatch builds these at startup and never changes them. Fetching them once took a refresh on the 17-table USDC demo from 38 KB to 18 KB; on an 81-table nest, `/tables` and `/schema` were 139 KB of every refresh. |
 | `GET /schema`, `GET /` | Only when `/nest` is not served, to find the nest name. |
+| `GET /nests` | Only on a runtime's root, found when the root has no `/tables`: the mounted nests and their health, refreshed with each poll. |
 
 Requests are made on a thread of their own, so a slow nest delays the numbers and never the keyboard. Selections made while a query is running are collapsed into one query for the last of them.
 
