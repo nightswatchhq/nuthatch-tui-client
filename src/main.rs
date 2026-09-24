@@ -1,7 +1,10 @@
 use std::{
     cell::Cell,
     collections::{BTreeMap, VecDeque},
-    io,
+    io::{self, Read},
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -414,6 +417,10 @@ fn spawn_worker(client: Client, base: String) -> (Sender<Request>, Receiver<Repl
 
 struct App {
     url: String,
+    /// What the header names: the nest's own URL, and the host when it is reached through ssh.
+    target: String,
+    /// Set while the ssh forward is down, and says when it will be reopened.
+    tunnel_problem: Option<String>,
     interval_override: Option<Duration>,
     no_color: bool,
     identity: Option<Identity>,
@@ -448,7 +455,9 @@ struct App {
 impl App {
     fn new(url: String) -> Self {
         Self {
+            target: url.clone(),
             url,
+            tunnel_problem: None,
             interval_override: None,
             no_color: false,
             identity: None,
@@ -879,7 +888,9 @@ impl App {
     }
 
     fn status(&self) -> String {
-        if self.last_refresh.is_none() {
+        if let Some(problem) = &self.tunnel_problem {
+            problem.clone()
+        } else if self.last_refresh.is_none() {
             "Connecting to nest…".into()
         } else if self.problems.is_empty() {
             "Live data received".into()
@@ -958,18 +969,92 @@ impl App {
     }
 }
 
+const DEFAULT_URL: &str = "http://127.0.0.1:8288";
+
+#[derive(Debug, Default)]
 struct Args {
-    url: String,
+    url: Option<String>,
+    ssh: Option<String>,
+    nest: Option<String>,
     interval: Option<Duration>,
+}
+
+/// One entry in `nests.toml`: where the nest listens, and the ssh host to reach it through when
+/// that is only on the host's loopback.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct NestTarget {
+    url: Option<String>,
+    ssh: Option<String>,
+}
+
+fn config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("nuthatch-tui").join("nests.toml"))
+}
+
+fn parse_nests(text: &str) -> Result<BTreeMap<String, NestTarget>> {
+    Ok(toml::from_str(text)?)
+}
+
+/// Flags win over the named entry, which wins over the default listener.
+fn resolve(args: &Args, nests: &BTreeMap<String, NestTarget>) -> Result<NestTarget> {
+    let named = match &args.nest {
+        Some(name) => nests.get(name).cloned().with_context(|| {
+            if nests.is_empty() {
+                format!("no nest called '{name}': no nests are configured")
+            } else {
+                let known = nests.keys().cloned().collect::<Vec<_>>().join(", ");
+                format!("no nest called '{name}'; configured: {known}")
+            }
+        })?,
+        None => NestTarget::default(),
+    };
+    Ok(NestTarget {
+        url: Some(normalize_url(
+            args.url
+                .clone()
+                .or(named.url)
+                .unwrap_or_else(|| DEFAULT_URL.into()),
+        )),
+        ssh: args.ssh.clone().or(named.ssh),
+    })
 }
 
 fn main() -> Result<()> {
     let args = parse_args(std::env::args().skip(1))?;
+    let nests = match config_path() {
+        Some(path) if path.exists() => parse_nests(
+            &std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", path.display()))?,
+        _ => BTreeMap::new(),
+    };
+    let target = resolve(&args, &nests)?;
+    let nest_url = target.url.expect("resolve always sets a url");
     let client = Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .context("building HTTP client")?;
-    let mut app = App::new(args.url);
+    let tunnel = match &target.ssh {
+        Some(host) => {
+            eprintln!("opening an ssh forward to {nest_url} on {host}…");
+            Some(Tunnel::open("ssh", host, &nest_url)?)
+        }
+        None => None,
+    };
+    let mut app = App::new(
+        tunnel
+            .as_ref()
+            .map_or_else(|| nest_url.clone(), |tunnel| tunnel.local_url.clone()),
+    );
+    if let Some(host) = &target.ssh {
+        app.target = format!("{nest_url} via {host}");
+    }
     app.interval_override = args.interval;
     app.no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
 
@@ -991,7 +1076,183 @@ fn main() -> Result<()> {
 
     let _screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    run(&mut terminal, client, &mut app, &quit)
+    run(&mut terminal, client, &mut app, tunnel, &quit)
+}
+
+/// An `ssh -N -L` forward to a nest that listens only on another host's loopback. `BatchMode`
+/// because a password prompt would land in the middle of the dashboard, and
+/// `ExitOnForwardFailure` so that a forward which cannot bind is an exit rather than a quiet ssh
+/// session forwarding nothing.
+struct Tunnel {
+    program: String,
+    host: String,
+    forward: String,
+    local_url: String,
+    local_port: u16,
+    child: Child,
+    opened_at: Instant,
+    failures: u32,
+    retry_at: Option<Instant>,
+    last_error: String,
+}
+
+impl Tunnel {
+    fn open(program: &str, host: &str, nest_url: &str) -> Result<Self> {
+        let mut url =
+            reqwest::Url::parse(nest_url).with_context(|| format!("'{nest_url}' is not a URL"))?;
+        let remote_host = url
+            .host_str()
+            .with_context(|| format!("'{nest_url}' names no host"))?
+            .to_owned();
+        let remote_port = url
+            .port_or_known_default()
+            .with_context(|| format!("'{nest_url}' names no port"))?;
+        let local_port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        url.set_host(Some("127.0.0.1"))?;
+        url.set_port(Some(local_port))
+            .map_err(|_| anyhow::anyhow!("cannot set a port on '{nest_url}'"))?;
+        let forward = format!("127.0.0.1:{local_port}:{remote_host}:{remote_port}");
+        let child =
+            spawn_ssh(program, host, &forward).with_context(|| format!("starting {program}"))?;
+        let mut tunnel = Self {
+            program: program.to_owned(),
+            host: host.to_owned(),
+            forward,
+            local_url: normalize_url(url.to_string()),
+            local_port,
+            child,
+            opened_at: Instant::now(),
+            failures: 0,
+            retry_at: None,
+            last_error: String::new(),
+        };
+        tunnel.wait_until_listening(Duration::from_secs(15))?;
+        Ok(tunnel)
+    }
+
+    fn wait_until_listening(&mut self, limit: Duration) -> Result<()> {
+        let started = Instant::now();
+        let address = ([127, 0, 0, 1], self.local_port).into();
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                let reason = self.stderr();
+                anyhow::bail!("ssh to {} exited ({status}): {reason}", self.host);
+            }
+            if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                started.elapsed() < limit,
+                "ssh to {} had not opened the forward after {}",
+                self.host,
+                format_span(limit)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn stderr(&mut self) -> String {
+        let mut text = String::new();
+        if let Some(mut stderr) = self.child.stderr.take() {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            "no message".into()
+        } else {
+            text.lines().last().unwrap_or(text).to_owned()
+        }
+    }
+
+    /// Called every loop: notices ssh exiting and reopens the forward with a doubling backoff.
+    /// Returns what the footer should say while the forward is down.
+    fn supervise(&mut self) -> Option<String> {
+        if let Some(at) = self.retry_at {
+            let now = Instant::now();
+            if now < at {
+                return Some(format!(
+                    "ssh to {} exited: {}. Reopening in {}",
+                    self.host,
+                    self.last_error,
+                    // A countdown rounds up, or the first second reads "in 0s".
+                    format_span(Duration::from_secs((at - now).as_secs_f64().ceil() as u64))
+                ));
+            }
+            self.retry_at = None;
+            match spawn_ssh(&self.program, &self.host, &self.forward) {
+                Ok(child) => {
+                    self.child = child;
+                    self.opened_at = now;
+                }
+                Err(error) => {
+                    self.last_error = error.to_string();
+                    self.schedule_retry();
+                }
+            }
+            return Some(format!("ssh to {}: reopening the forward", self.host));
+        }
+        match self.child.try_wait() {
+            Ok(None) => {
+                if self.opened_at.elapsed() > TUNNEL_SETTLED {
+                    self.failures = 0;
+                }
+                None
+            }
+            Ok(Some(_)) => {
+                self.last_error = self.stderr();
+                self.schedule_retry();
+                self.supervise()
+            }
+            Err(error) => Some(format!("ssh to {}: {error}", self.host)),
+        }
+    }
+
+    fn schedule_retry(&mut self) {
+        self.retry_at = Some(Instant::now() + tunnel_backoff(self.failures));
+        self.failures += 1;
+    }
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A forward that has stayed up this long is healthy, and its next failure starts the backoff over.
+const TUNNEL_SETTLED: Duration = Duration::from_secs(60);
+
+fn tunnel_backoff(failures: u32) -> Duration {
+    Duration::from_secs((1u64 << failures.min(5)).min(30))
+}
+
+fn ssh_args(host: &str, forward: &str) -> Vec<String> {
+    [
+        "-N",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-L",
+        forward,
+        host,
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+fn spawn_ssh(program: &str, host: &str, forward: &str) -> io::Result<Child> {
+    Command::new(program)
+        .args(ssh_args(host, forward))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
 }
 
 /// Raw mode and the alternate screen, undone on drop. A signal is turned into an ordinary return
@@ -1017,30 +1278,28 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
 }
 
+const USAGE: &str = "\
+nuthatch-tui-client [--url URL] [--ssh HOST] [--nest NAME] [--interval 5s]
+
+  --url URL       the nest's API, as seen from where it runs (default http://127.0.0.1:8288)
+  --ssh HOST      reach it through an ssh forward to HOST, for a nest bound to loopback there
+  --nest NAME     take url and ssh from NAME in ~/.config/nuthatch-tui/nests.toml
+  --interval DUR  poll this often instead of as often as the nest polls";
+
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args> {
-    let mut parsed = Args {
-        url: "http://127.0.0.1:8288".into(),
-        interval: None,
-    };
+    let mut parsed = Args::default();
     while let Some(arg) = args.next() {
+        let mut value = |what: &str| args.next().with_context(|| format!("{arg} needs {what}"));
         match arg.as_str() {
-            "--url" => {
-                parsed.url = args
-                    .next()
-                    .map(normalize_url)
-                    .context("--url needs a Nuthatch base URL")?;
-            }
-            "--interval" => {
-                let value = args
-                    .next()
-                    .context("--interval needs a duration, e.g. 5s")?;
-                parsed.interval = Some(parse_interval(&value)?);
-            }
+            "--url" => parsed.url = Some(normalize_url(value("a Nuthatch base URL")?)),
+            "--ssh" => parsed.ssh = Some(value("an ssh host")?),
+            "--nest" => parsed.nest = Some(value("a name from nests.toml")?),
+            "--interval" => parsed.interval = Some(parse_interval(&value("a duration, e.g. 5s")?)?),
             "-h" | "--help" => {
-                println!("nuthatch-tui-client [--url http://127.0.0.1:8288] [--interval 5s]");
+                println!("{USAGE}");
                 std::process::exit(0);
             }
-            value => anyhow::bail!("unknown argument '{value}'; try --help"),
+            other => anyhow::bail!("unknown argument '{other}'; try --help"),
         }
     }
     Ok(parsed)
@@ -1066,6 +1325,7 @@ fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     client: Client,
     app: &mut App,
+    mut tunnel: Option<Tunnel>,
     quit: &AtomicBool,
 ) -> Result<()> {
     let (requests, replies) = spawn_worker(client, app.url.clone());
@@ -1075,6 +1335,9 @@ fn run<B: Backend>(
             .map_err(|_| anyhow::anyhow!("the fetch thread has stopped"))
     };
     loop {
+        if let Some(tunnel) = tunnel.as_mut() {
+            app.tunnel_problem = tunnel.supervise();
+        }
         for reply in replies.try_iter() {
             match reply {
                 Reply::Poll(result) => app.apply(*result),
@@ -1556,7 +1819,7 @@ fn draw(frame: &mut Frame, app: &App) {
         ));
     }
     header.push(Span::styled(
-        format!("   {}", app.url),
+        format!("   {}", app.target),
         Style::default().fg(Color::DarkGray),
     ));
     let title = Paragraph::new(Line::from(header)).block(
@@ -2571,7 +2834,7 @@ mod tests {
     fn arguments_take_a_url_and_an_interval_in_either_order() {
         let args = |list: &[&str]| parse_args(list.iter().map(|arg| arg.to_string()));
         let parsed = args(&["--interval", "2m", "--url", "http://h:1/"]).unwrap();
-        assert_eq!(parsed.url, "http://h:1");
+        assert_eq!(parsed.url.as_deref(), Some("http://h:1"));
         assert_eq!(parsed.interval, Some(Duration::from_secs(120)));
         assert_eq!(
             args(&["--interval", "5"]).unwrap().interval,
@@ -2580,6 +2843,178 @@ mod tests {
         assert!(args(&["--interval", "0s"]).is_err());
         assert!(args(&["--interval", "soon"]).is_err());
         assert!(args(&["--bogus"]).is_err());
+        assert!(args(&["--ssh"]).is_err());
+        let parsed = args(&["--nest", "allocations", "--ssh", "hel1"]).unwrap();
+        assert_eq!(parsed.nest.as_deref(), Some("allocations"));
+        assert_eq!(parsed.ssh.as_deref(), Some("hel1"));
+    }
+
+    const NESTS: &str = r#"
+        [allocations]
+        url = "http://127.0.0.1:8107"
+        ssh = "89.167.109.4"
+
+        [local]
+        url = "http://127.0.0.1:18288/"
+    "#;
+
+    #[test]
+    fn a_named_nest_supplies_url_and_host_and_flags_override_it() {
+        let nests = parse_nests(NESTS).unwrap();
+        let args = |nest: Option<&str>, url: Option<&str>, ssh: Option<&str>| Args {
+            nest: nest.map(String::from),
+            url: url.map(String::from),
+            ssh: ssh.map(String::from),
+            interval: None,
+        };
+        assert_eq!(
+            resolve(&args(Some("allocations"), None, None), &nests).unwrap(),
+            NestTarget {
+                url: Some("http://127.0.0.1:8107".into()),
+                ssh: Some("89.167.109.4".into()),
+            }
+        );
+        assert_eq!(
+            resolve(
+                &args(
+                    Some("allocations"),
+                    Some("http://127.0.0.1:8095"),
+                    Some("nbg1")
+                ),
+                &nests
+            )
+            .unwrap(),
+            NestTarget {
+                url: Some("http://127.0.0.1:8095".into()),
+                ssh: Some("nbg1".into()),
+            }
+        );
+        assert_eq!(
+            resolve(&args(Some("local"), None, None), &nests)
+                .unwrap()
+                .url
+                .as_deref(),
+            Some("http://127.0.0.1:18288")
+        );
+        assert_eq!(
+            resolve(&args(None, None, None), &nests)
+                .unwrap()
+                .url
+                .as_deref(),
+            Some(DEFAULT_URL)
+        );
+        let unknown = resolve(&args(Some("staking"), None, None), &nests).unwrap_err();
+        assert_eq!(
+            unknown.to_string(),
+            "no nest called 'staking'; configured: allocations, local"
+        );
+        assert!(
+            parse_nests("[x]\nurl = \"u\"\nport = 1\n").is_err(),
+            "typos are refused"
+        );
+    }
+
+    #[test]
+    fn ssh_is_asked_for_a_batch_mode_forward_that_fails_loudly() {
+        let args = ssh_args("hel1", "127.0.0.1:40000:127.0.0.1:8107");
+        assert_eq!(args.last().map(String::as_str), Some("hel1"));
+        for expected in [
+            "-N",
+            "BatchMode=yes",
+            "ExitOnForwardFailure=yes",
+            "127.0.0.1:40000:127.0.0.1:8107",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == expected),
+                "{expected} missing from {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tunnel_backs_off_doubling_to_half_a_minute() {
+        let delays: Vec<u64> = (0..8).map(|n| tunnel_backoff(n).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
+    }
+
+    /// A stand-in for ssh: listens on the local end of `-L` as a real forward would, or with
+    /// `fail` set, says what ssh says when the key is refused and exits the way it does.
+    #[cfg(unix)]
+    fn fake_ssh(fail: bool) -> String {
+        use std::{os::unix::fs::PermissionsExt, sync::atomic::AtomicUsize};
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "nuthatch-tui-fake-ssh-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let body = if fail {
+            "echo 'hel1: Permission denied (publickey).' >&2; exit 255".to_owned()
+        } else {
+            "while [ $# -gt 0 ]; do [ \"$1\" = -L ] && forward=$2; shift; done\n\
+             port=${forward#127.0.0.1:}; port=${port%%:*}\n\
+             exec python3 -c \"import socket, time; s = socket.socket(); \
+             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); \
+             s.bind(('127.0.0.1', $port)); s.listen(); time.sleep(60)\""
+                .to_owned()
+        };
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_tunnel_rewrites_the_url_onto_its_local_end() {
+        let tunnel = Tunnel::open(
+            &fake_ssh(false),
+            "hel1",
+            "http://127.0.0.1:8107/allocations",
+        )
+        .unwrap();
+        assert_eq!(
+            tunnel.local_url,
+            format!("http://127.0.0.1:{}/allocations", tunnel.local_port)
+        );
+        assert!(tunnel.forward.ends_with(":127.0.0.1:8107"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_key_is_reported_before_the_dashboard_opens() {
+        let error = Tunnel::open(&fake_ssh(true), "hel1", "http://127.0.0.1:8107")
+            .err()
+            .expect("a refused key must not open");
+        let message = error.to_string();
+        assert!(
+            message.contains("Permission denied (publickey)."),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_tunnel_is_reported_and_reopened() {
+        let mut tunnel = Tunnel::open(&fake_ssh(false), "hel1", "http://127.0.0.1:8107").unwrap();
+        assert_eq!(tunnel.supervise(), None);
+        tunnel.child.kill().unwrap();
+        tunnel.child.wait().unwrap();
+        let down = tunnel.supervise().expect("a dead forward is reported");
+        assert!(down.starts_with("ssh to hel1 exited"), "{down}");
+        assert!(down.contains("Reopening in 1s"), "{down}");
+        tunnel.retry_at = Some(Instant::now());
+        assert_eq!(
+            tunnel.supervise().as_deref(),
+            Some("ssh to hel1: reopening the forward")
+        );
+        tunnel
+            .wait_until_listening(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(tunnel.supervise(), None);
+        assert_eq!(
+            tunnel.failures, 1,
+            "the backoff only resets once the forward has settled"
+        );
     }
 
     #[test]
@@ -2778,15 +3213,23 @@ mod tests {
 
     /// Prints the dashboard as drawn against a real nest, which is how the README's sample screen
     /// is made: `NUTHATCH_URL=http://127.0.0.1:18288 cargo test live -- --ignored --nocapture`.
+    /// With `NUTHATCH_SSH=host` it goes through a forward, as `--ssh` does.
     #[test]
     #[ignore = "needs a running nest at NUTHATCH_URL"]
     fn live() {
-        let url = std::env::var("NUTHATCH_URL").expect("NUTHATCH_URL");
+        let url = normalize_url(std::env::var("NUTHATCH_URL").expect("NUTHATCH_URL"));
+        let tunnel = std::env::var("NUTHATCH_SSH")
+            .ok()
+            .map(|host| Tunnel::open("ssh", &host, &url).expect("ssh forward"));
         let client = Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap();
-        let mut app = App::new(normalize_url(url));
+        let mut app = App::new(
+            tunnel
+                .as_ref()
+                .map_or_else(|| url.clone(), |tunnel| tunnel.local_url.clone()),
+        );
         for _ in 0..6 {
             app.refresh(&client);
             std::thread::sleep(app.poll_interval());
