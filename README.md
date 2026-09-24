@@ -13,31 +13,31 @@ It is a client, not an indexer. It does not need an RPC key, open a store, alter
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ╭ NEST HEALTH ───────────────────╮╭ DATA COLLECTED ───────────────╮╭ SYNC POSITION ────────────────╮
 │ STATUS  READY                  ││ Tables          17            ││ █████████████████████████████ │
-│ Tip             26,048,679     ││ Decoded rows    31,226        ││ █████████████████████████████ │
-│ Indexed         26,048,679     ││ Sealed rows     20,075        ││ ███26,048,679 / 26,048,679 ██ │
-│ Sealed          26,048,575     ││ Lag             0 blocks      ││ █████████████████████████████ │
-│ Seal gap        104            ││ Restarts        none seen     ││ █████████████████████████████ │
+│ Tip             26,048,984     ││ Decoded rows    7,100         ││ █████████████████████████████ │
+│ Indexed         26,048,984     ││ Sealed rows     0             ││ ███████████at tip ███████████ │
+│ Sealed          26,048,764     ││ Lag             0 blocks      ││ █████████████████████████████ │
+│ Seal gap        220            ││ Restarts        none seen     ││ █████████████████████████████ │
 ╰────────────────────────────────╯╰───────────────────────────────╯╰───────────────────────────────╯
 ╭ INDEXED TABLES  1/17  ↑↓ j k ──────╮╭ PERFORMANCE  rates warming 10/60s  (w) ────────────────────╮
-│ usdc__approval                     ││ RPC REQUESTS  2,964 since start  1.2 req/s  71 req/min     │
-│ usdc__authorization_canceled       ││ RPC METHODS     2,964 since start  1.2 calls/s             │
-│ usdc__authorization_used           ││ DECODED ROWS    31,226 since start  8.6 rows/s             │
-│ usdc__blacklisted                  ││ INDEXED BLOCKS  0.1 blocks/s  5.9 blocks/min               │
-│ usdc__blacklister_changed          ││ MEMORY RSS      172.0 MiB                                  │
-│ usdc__burn                         ││ API REFRESH     14 ms  poll 2s ago, every 2s               │
-│ usdc__master_minter_changed        ││ REORGS  0 since start   CPU  1.6%                          │
-│ usdc__mint                         ││ DISK            hot 32.6 MiB  sealed 1.0 MiB               │
-│ usdc__minter_configured            ││ RPC HEALTH      fail 1  retry 0  latency 83 ms avg         │
+│ usdc__approval                     ││ RPC REQUESTS  495 since start  0.8 req/s  48 req/min       │
+│ usdc__authorization_canceled       ││ RPC METHODS     495 since start  0.8 calls/s               │
+│ usdc__authorization_used           ││ DECODED ROWS    7,100 since start  0 rows/s                │
+│ usdc__blacklisted                  ││ INDEXED BLOCKS  0 blocks/s  0 blocks/min                   │
+│ usdc__blacklister_changed          ││ MEMORY RSS      149.2 MiB                                  │
+│ usdc__burn                         ││ API REFRESH     16 ms  poll 2s ago, every 2s               │
+│ usdc__master_minter_changed        ││ REORGS  0 since start   CPU  0.8%                          │
+│ usdc__mint                         ││ DISK            hot 32.6 MiB  sealed 1.9 MiB               │
+│ usdc__minter_configured            ││ RPC HEALTH      fail 0  retry 0  latency 81 ms avg         │
 │ usdc__minter_removed               │╰────────────────────────────────────────────────────────────╯
 │ usdc__ownership_transferred        │╭ LIVE EVENT FEED ───────────────────────────────────────────╮
-│ usdc__pause                        ││ #26,048,679  owner=0xb92fe925dc43a0ecde6…  spender=0x00000 │
-│ usdc__pauser_changed               ││ #26,048,679  owner=0x4f4e5cc125cc8492c06…  spender=0x77777 │
-╰────────────────────────────────────╯│ #26,048,679  owner=0x11852e69f4cb7298e52…  spender=0x77777 │
-╭ SELECTED TABLE ────────────────────╮│ #26,048,679  owner=0x5a905430c21be952131…  spender=0xb5571 │
+│ usdc__pause                        ││ block       owner        spender      value                │
+│ usdc__pauser_changed               ││ 26,048,983  0xf083…d1d7  0x8787…a4e2  26,734,150           │
+╰────────────────────────────────────╯│ 26,048,983  0xb5e1…b0e0  0x1111…2a65  8,317,550            │
+╭ SELECTED TABLE ────────────────────╮│ 26,048,983  0xb92f…ff4f  0x4cd0…bc31  176,605,151          │
 │ usdc__approval                     │╰────────────────────────────────────────────────────────────╯
-│ Rows    4,001                      │╭ RPC / 2s  peak 6 ───────────╮╭ API REFRESH / 2s  peak 59 ms╮
-│ Latest  26,048,679                 ││   █                         ││ █ ▆                         │
-│ Storage integrity: healthy         ││  ▅█▂▂▅                      ││ █▃██▁▃                      │
+│ Rows    7,890                      │╭ RPC / 2s  peak 2 ───────────╮╭ REFRESH / 2s  peak 79 ms ───╮
+│ Latest  26,048,983                 ││  ███ █                      ││ █                           │
+│ Storage integrity: healthy         ││  ███ █                      ││ █▁▁▁▃▃                      │
 ╰────────────────────────────────────╯╰─────────────────────────────╯╰─────────────────────────────╯
  q  quit    r  refresh    ↑↓  tables    w  rate window   Live data received
 ```
@@ -48,11 +48,11 @@ It is a client, not an indexer. It does not need an RPC key, open a store, alter
 |---|---|
 | **Nest health** | Is the indexer ready? What are the tip, indexed, and sealed block heights, and how far does the seal trail the index? During a seal-direct backfill, where the pass started. |
 | **Data collected** | How many event tables exist, rows decoded, rows sealed, blocks of lag, and how many Nuthatch restarts the client has seen while watching. |
-| **Sync position** | How closely the committed cursor follows the chain tip. |
+| **Sync position** | How far the cursor trails the tip, in blocks and in time. The fill measures that lag against the least the nest can be expected to trail by, one poll interval's worth of blocks or one block, whichever is more: full within it, half at twice it. During a backfill, the pass's progress instead. |
 | **Indexed tables** | The event tables exposed by the nest's schema, scrolled to keep the selection in view, with its position in the title. |
 | **Performance** | Rolling RPC request, RPC method, decoded-row, and indexed-block rates; lifetime counters; API refresh time; source-poll age; RSS; CPU utilisation; hot-store and sealed-segment disk footprint; RPC endpoint failures, retries, and average latency; and reorg count. The panel title carries the active rolling window; press `w` to choose 15, 60, or 90 seconds. |
 | **Selected table** | Row count and latest block for the selected event table, or a note that the nest has closed free-form SQL. |
-| **Live event feed** | The six newest decoded rows for the selected table, or the nest's named queries when SQL is closed. Yields its space to the performance panel on a short terminal. |
+| **Live event feed** | The newest decoded rows for the selected table, as many as the panel has room for, as a table in the schema's column order. Columns are taken while they fit; addresses are shortened in the middle, and integers past fifteen digits turn scientific (`1.15e77`). Shows the nest's named queries instead when SQL is closed. Yields its space to the performance panel on a short terminal. |
 | **RPC / API refresh** | Two sparklines: RPC requests and peak API refresh time, one bar per nest poll interval. Each title carries its own peak, since each bar is scaled to it. |
 
 The header leads with the nest's state. `● LIVE`, `● ATTENTION`, `● BACKFILL` and `● QUARANTINED` come from `/ready`, including the 503 body a stalled nest answers with. `(partial)` is added when the nest answered but some endpoint behind a panel did not; the footer names which. `● STALE` means `/ready` itself stopped answering and every number on screen is the last one received.
@@ -134,7 +134,7 @@ The client uses only public, read-only Nuthatch endpoints:
 |---|---|
 | `GET /ready` | Every refresh. Readiness, head positions, lag, stall state, poll interval, backfill, and version. A 503 is read, not discarded: it is how a stalled nest answers. |
 | `GET /metrics` | Every refresh. Prometheus counters and gauges for rows, RPC activity, process RSS, reorgs, and positions. |
-| `GET /sql?q=…` | Every refresh, and on changing the selection. A count and the six newest rows for the selected table, which is quoted as an identifier. Skipped entirely on a nest whose `/queries` says SQL is closed. |
+| `GET /sql?q=…` | Every refresh, and on changing the selection. A count, and the newest rows for the selected table by its decoded columns, all quoted as identifiers. Naming the columns leaves out the `_dec` and `_overflow` companions Nuthatch adds to every big integer for arithmetic; the plain column already holds the exact decimal text. Skipped entirely on a nest whose `/queries` says SQL is closed. |
 | `GET /tables`, `GET /nest`, `GET /queries` | Once, and again after a restart. The table catalogue, the nest's name and chain, and whether free-form SQL is open. Nuthatch builds these at startup and never changes them. Fetching them once took a refresh on the 17-table USDC demo from 38 KB to 18 KB; on an 81-table nest, `/tables` and `/schema` were 139 KB of every refresh. |
 | `GET /schema`, `GET /` | Only when `/nest` is not served, to find the nest name. |
 
@@ -163,7 +163,8 @@ The dashboard degrades each of these independently rather than displaying a misl
 
 ## Current limits
 
-- The client is a dashboard, not a general SQL workbench. It presents a summary and a six-row live feed for the selected event table.
+- The client is a dashboard, not a general SQL workbench. It presents a summary and a live feed for the selected event table.
+- The sync gauge needs the tip to move between two samples before it knows the chain's block rate. Until then it treats one block as the expected lag.
 - It reports request count, not exact provider cost. Billing models differ by provider and method.
 - On Nuthatch before 3.0.0, CPU utilisation is only accurate when the nest itself is Linux-hosted; a Mac-hosted nest reports a flat `0.0%` rather than `unavailable` ([nightswatchhq/nuthatch#844](https://github.com/nightswatchhq/nuthatch/issues/844)).
 - A restart is only seen if it happens while the client is watching, and only if the counters have not climbed past their old values by the next sample. A restart before the client started is invisible to it.

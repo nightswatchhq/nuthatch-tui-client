@@ -35,6 +35,8 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const HISTORY_LEN: usize = 48;
 const TABLE_PAGE: usize = 10;
+const DEFAULT_FEED_ROWS: usize = 6;
+const MAX_FEED_ROWS: usize = 50;
 const ACTIVITY_LEN: usize = 64;
 /// How long an observed restart keeps the restart line lit.
 const RECENT_RESTART: Duration = Duration::from_secs(600);
@@ -99,6 +101,86 @@ struct Tables {
 #[derive(Debug, Deserialize, Clone)]
 struct EventTable {
     table: String,
+    #[serde(default)]
+    columns: Vec<Column>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Column {
+    name: String,
+    #[serde(default)]
+    sol_type: String,
+}
+
+/// Columns every row carries that say where it came from rather than what happened.
+const IMPLICIT_COLUMNS: [&str; 7] = [
+    "block_number",
+    "block_hash",
+    "tx_hash",
+    "log_index",
+    "address",
+    "_seq",
+    "block_timestamp",
+];
+
+/// The feed and summary queries for one table. The catalogue lists only decoded columns, so
+/// selecting them by name also leaves out the `_dec` and `_overflow` companions Nuthatch adds to
+/// every big integer for arithmetic; the plain column already holds the exact decimal text.
+#[derive(Debug, Clone)]
+struct SelectionQuery {
+    table: String,
+    columns: Vec<String>,
+    has_log_index: bool,
+    limit: usize,
+}
+
+impl SelectionQuery {
+    fn new(table: &EventTable, limit: usize) -> Self {
+        Self {
+            table: table.table.clone(),
+            columns: table
+                .columns
+                .iter()
+                .filter(|column| column.sol_type != "implicit")
+                .map(|column| column.name.clone())
+                .collect(),
+            has_log_index: table.columns.is_empty()
+                || table
+                    .columns
+                    .iter()
+                    .any(|column| column.name == "log_index"),
+            limit,
+        }
+    }
+
+    fn counts_sql(&self) -> String {
+        format!(
+            "SELECT count(*) AS rows, max(block_number) AS latest_block FROM {}",
+            quote_identifier(&self.table)
+        )
+    }
+
+    fn events_sql(&self) -> String {
+        let columns = if self.columns.is_empty() {
+            "*".to_owned()
+        } else {
+            std::iter::once("block_number")
+                .chain(self.columns.iter().map(String::as_str))
+                .map(quote_identifier)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let order = if self.has_log_index {
+            "block_number DESC, log_index DESC"
+        } else {
+            "block_number DESC"
+        };
+        format!(
+            "SELECT {columns} FROM {} ORDER BY {order} LIMIT {}",
+            quote_identifier(&self.table),
+            self.limit
+        )
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -158,6 +240,7 @@ struct Identity {
 #[derive(Default)]
 struct Selection {
     table: String,
+    columns: Vec<String>,
     rows: Option<u64>,
     latest_block: Option<u64>,
     events: Vec<Value>,
@@ -171,6 +254,7 @@ struct Sample {
     rpc_requests: Option<u64>,
     rpc_methods: Option<u64>,
     indexed_block: Option<u64>,
+    tip: Option<u64>,
     cpu_seconds: Option<f64>,
 }
 
@@ -237,8 +321,9 @@ type Problem = (&'static str, String);
 /// restart keeps the operator's place in it.
 struct PollRequest {
     identity: bool,
-    table: Option<String>,
+    selection: Option<SelectionQuery>,
     sql_open: bool,
+    feed_limit: usize,
 }
 
 struct PollResult {
@@ -252,7 +337,7 @@ struct PollResult {
 
 enum Request {
     Poll(PollRequest),
-    Selection(String),
+    Selection(SelectionQuery),
 }
 
 enum Reply {
@@ -266,22 +351,26 @@ fn poll(client: &Client, base: &str, request: &PollRequest) -> PollResult {
     let ready = fetch_ready(client, base);
     let metrics =
         fetch_ok(client, &format!("{base}/metrics"), &[]).map(|text| parse_prometheus(&text));
-    let (table, sql_open) = match &identity {
+    let (query, sql_open) = match &identity {
         Some(Ok(identity)) => {
             let tables = &identity.tables.tables;
-            let table = request
-                .table
-                .clone()
-                .filter(|name| tables.iter().any(|table| table.table == *name))
-                .or_else(|| tables.first().map(|table| table.table.clone()));
-            (table, identity.sql == SqlAccess::Open)
+            let wanted = request.selection.as_ref().map(|query| query.table.as_str());
+            let table = tables
+                .iter()
+                .find(|table| Some(table.table.as_str()) == wanted)
+                .or(tables.first());
+            (
+                table.map(|table| SelectionQuery::new(table, request.feed_limit)),
+                identity.sql == SqlAccess::Open,
+            )
         }
-        _ => (request.table.clone(), request.sql_open),
+        _ => (request.selection.clone(), request.sql_open),
     };
-    let selection = table
-        .as_deref()
+    let selection = query
+        .as_ref()
         .filter(|_| sql_open)
-        .map(|table| fetch_selection(client, base, table));
+        .map(|query| fetch_selection(client, base, query));
+    let table = query.map(|query| query.table);
     PollResult {
         identity,
         ready,
@@ -344,6 +433,8 @@ struct App {
     selected_table: usize,
     /// The table list's scroll position, kept between frames so moving up does not jerk the view.
     table_offset: Cell<usize>,
+    /// Rows the feed panel had room for when last drawn, which sizes the next feed query.
+    feed_limit: Cell<usize>,
     refresh_time: Option<Duration>,
     last_refresh: Option<Instant>,
     poll_in_flight: bool,
@@ -370,6 +461,7 @@ impl App {
             rate_window: 1,
             selected_table: 0,
             table_offset: Cell::new(0),
+            feed_limit: Cell::new(DEFAULT_FEED_ROWS),
             refresh_time: None,
             last_refresh: None,
             poll_in_flight: false,
@@ -387,12 +479,23 @@ impl App {
     fn poll_request(&self) -> PollRequest {
         PollRequest {
             identity: self.identity.is_none() || self.refetch_identity,
-            table: self.selected_table_name().map(str::to_owned),
+            selection: self.selection_query(),
             sql_open: self
                 .identity
                 .as_ref()
                 .is_some_and(|identity| identity.sql == SqlAccess::Open),
+            feed_limit: self.feed_limit.get(),
         }
+    }
+
+    fn selection_query(&self) -> Option<SelectionQuery> {
+        let table = self
+            .identity
+            .as_ref()?
+            .tables
+            .tables
+            .get(self.selected_table)?;
+        Some(SelectionQuery::new(table, self.feed_limit.get()))
     }
 
     fn apply(&mut self, result: PollResult) {
@@ -466,6 +569,7 @@ impl App {
             rpc_requests: metrics.and_then(|m| metric_opt_u64(m, "nuthatch_rpc_requests_total")),
             rpc_methods: metrics.and_then(|m| metric_opt_u64(m, "nuthatch_rpc_methods_total")),
             indexed_block: self.ready.as_ref().map(|ready| ready.last_block),
+            tip: self.ready.as_ref().and_then(|ready| ready.tip),
             cpu_seconds: metrics
                 .and_then(|m| m.get("nuthatch_process_cpu_seconds_total"))
                 .copied(),
@@ -524,7 +628,7 @@ impl App {
 
     /// Moves the selection, clamped to the list, and returns the table to query if it changed and
     /// the nest allows asking.
-    fn select(&mut self, index: usize) -> Option<String> {
+    fn select(&mut self, index: usize) -> Option<SelectionQuery> {
         let last = self.table_count().checked_sub(1)?;
         let index = index.min(last);
         if index == self.selected_table {
@@ -534,15 +638,15 @@ impl App {
         self.identity
             .as_ref()
             .filter(|identity| identity.sql == SqlAccess::Open)?;
-        self.selected_table_name().map(str::to_owned)
+        self.selection_query()
     }
 
-    fn select_next(&mut self) -> Option<String> {
+    fn select_next(&mut self) -> Option<SelectionQuery> {
         let count = self.table_count().max(1);
         self.select((self.selected_table + 1) % count)
     }
 
-    fn select_previous(&mut self) -> Option<String> {
+    fn select_previous(&mut self) -> Option<SelectionQuery> {
         let count = self.table_count().max(1);
         self.select((self.selected_table + count - 1) % count)
     }
@@ -560,6 +664,54 @@ impl App {
             .tables
             .get(self.selected_table)
             .map(|table| table.table.as_str())
+    }
+
+    /// Blocks per second, from how far the tip moved across the sample history.
+    fn chain_block_rate(&self) -> Option<f64> {
+        let (first, last) = (self.samples.first()?, self.samples.last()?);
+        let blocks = last.tip?.checked_sub(first.tip?)?;
+        let seconds = last.at.duration_since(first.at).as_secs_f64();
+        (blocks > 0 && seconds > 0.0).then(|| blocks as f64 / seconds)
+    }
+
+    /// The gauge's fill and label. Lag is measured against the least the nest can be expected to
+    /// trail by, one poll interval's worth of blocks or one block, whichever is more: full within
+    /// that, half at twice it. `1 - lag / tip` read as full for any lag an arbitrum nest could have.
+    fn sync(&self) -> (f64, String) {
+        let Some(ready) = self.ready.as_ref() else {
+            return (0.0, "waiting for /ready".into());
+        };
+        if let Some(backfill) = self.backfill() {
+            let span = backfill.target.saturating_sub(backfill.origin).max(1);
+            let done = backfill.current.saturating_sub(backfill.origin).min(span);
+            return (
+                done as f64 / span as f64,
+                format!(
+                    "{} / {}",
+                    group_digits(backfill.current),
+                    group_digits(backfill.target)
+                ),
+            );
+        }
+        let (Some(_), Some(lag)) = (ready.tip, ready.lag_blocks) else {
+            return (0.0, "cursorless".into());
+        };
+        if lag == 0 {
+            return (1.0, "at tip".into());
+        }
+        let rate = self.chain_block_rate();
+        let step = rate.map_or(1.0, |rate| {
+            (rate * self.activity_width().as_secs_f64()).max(1.0)
+        });
+        let label = match rate {
+            Some(rate) => format!(
+                "{} blocks · {} behind",
+                group_digits(lag),
+                format_span(Duration::from_secs_f64(lag as f64 / rate))
+            ),
+            None => format!("{} blocks behind", group_digits(lag)),
+        };
+        ((step / lag as f64).min(1.0), label)
     }
 
     fn backfill(&self) -> Option<Backfill> {
@@ -965,28 +1117,18 @@ fn fallback_nest_name(client: &Client, base: &str) -> Option<String> {
         })
 }
 
-fn fetch_selection(client: &Client, base: &str, table: &str) -> Result<Selection, String> {
+fn fetch_selection(
+    client: &Client,
+    base: &str,
+    query: &SelectionQuery,
+) -> Result<Selection, String> {
     let url = format!("{base}/sql");
-    let quoted = quote_identifier(table);
-    let counts: SqlResponse = fetch_json(
-        client,
-        &url,
-        &[(
-            "q",
-            &format!("SELECT count(*) AS rows, max(block_number) AS latest_block FROM {quoted}"),
-        )],
-    )?;
-    let events: SqlResponse = fetch_json(
-        client,
-        &url,
-        &[(
-            "q",
-            &format!("SELECT * FROM {quoted} ORDER BY block_number DESC, log_index DESC LIMIT 6"),
-        )],
-    )?;
+    let counts: SqlResponse = fetch_json(client, &url, &[("q", &query.counts_sql())])?;
+    let events: SqlResponse = fetch_json(client, &url, &[("q", &query.events_sql())])?;
     let row = counts.rows.first().and_then(Value::as_object);
     Ok(Selection {
-        table: table.to_owned(),
+        table: query.table.clone(),
+        columns: query.columns.clone(),
         rows: row.and_then(|row| row.get("rows")).and_then(Value::as_u64),
         latest_block: row
             .and_then(|row| row.get("latest_block"))
@@ -1030,8 +1172,15 @@ fn metric_opt_u64(metrics: &BTreeMap<String, f64>, name: &str) -> Option<u64> {
 }
 
 fn group_digits(value: u64) -> String {
-    let digits = value.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    group_decimal(&value.to_string())
+}
+
+fn group_decimal(digits: &str) -> String {
+    let (sign, digits) = digits
+        .strip_prefix('-')
+        .map_or(("", digits), |rest| ("-", rest));
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    grouped.push_str(sign);
     for (index, digit) in digits.chars().enumerate() {
         if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
@@ -1126,27 +1275,123 @@ fn shorten(value: &str, width: usize) -> String {
     }
 }
 
-fn event_line(row: &Value) -> String {
-    let Some(row) = row.as_object() else {
-        return "unreadable event row".into();
+fn format_value(value: &Value) -> String {
+    match value {
+        Value::String(text) if text.starts_with("0x") && text.len() > 14 => {
+            format!("{}…{}", &text[..6], &text[text.len() - 4..])
+        }
+        Value::String(text)
+            if !text.is_empty()
+                && text
+                    .trim_start_matches('-')
+                    .bytes()
+                    .all(|b| b.is_ascii_digit()) =>
+        {
+            format_decimal(text)
+        }
+        Value::String(text) => shorten(text, 24),
+        other => other.to_string(),
+    }
+}
+
+/// Big integers arrive as exact decimal text. Past fifteen digits the exact figure no longer fits a
+/// feed line, and an unlimited approval (2^256 - 1) is seventy-eight of them.
+fn format_decimal(text: &str) -> String {
+    let (sign, digits) = text
+        .strip_prefix('-')
+        .map_or(("", text), |rest| ("-", rest));
+    if digits.len() <= 15 {
+        return group_decimal(text);
+    }
+    format!(
+        "{sign}{}.{}e{}",
+        &digits[..1],
+        &digits[1..3],
+        digits.len() - 1
+    )
+}
+
+/// The feed as a small table: column names once in a header, then a line per row, taking columns
+/// in declared order while they fit. A nest that published no column list gets the first row's
+/// own keys, less the implicit ones and the big-integer companions.
+fn feed_lines(rows: &[Value], columns: &[String], width: usize) -> Vec<String> {
+    let rows: Vec<_> = rows.iter().filter_map(Value::as_object).collect();
+    let Some(first) = rows.first() else {
+        return Vec::new();
     };
-    let block = row
-        .get("block_number")
-        .and_then(Value::as_u64)
-        .map_or("?".into(), group_digits);
-    let details = row
+    let names: Vec<&str> = if columns.is_empty() {
+        first
+            .keys()
+            .map(String::as_str)
+            .filter(|key| {
+                !IMPLICIT_COLUMNS.contains(key)
+                    && *key != "table"
+                    && !key.ends_with("_dec")
+                    && !key.ends_with("_overflow")
+            })
+            .collect()
+    } else {
+        columns.iter().map(String::as_str).collect()
+    };
+    let blocks: Vec<String> = rows
         .iter()
-        .filter(|(key, _)| {
-            !matches!(
-                key.as_str(),
-                "block_number" | "block_hash" | "tx_hash" | "log_index" | "address" | "_seq"
-            )
+        .map(|row| {
+            row.get("block_number")
+                .and_then(Value::as_u64)
+                .map_or("?".into(), group_digits)
         })
-        .take(2)
-        .map(|(key, value)| format!("{key}={}", shorten(value.to_string().trim_matches('"'), 22)))
-        .collect::<Vec<_>>()
-        .join("  ");
-    format!("#{block:<11} {details}")
+        .collect();
+    let mut chosen: Vec<FeedColumn> = Vec::new();
+    let mut used = 0;
+    let named = names.into_iter().map(|name| {
+        let cells: Vec<String> = rows
+            .iter()
+            .map(|row| row.get(name).map_or("—".into(), format_value))
+            .collect();
+        (name, cells)
+    });
+    for (name, cells) in std::iter::once(("block", blocks)).chain(named) {
+        let width_needed = cells
+            .iter()
+            .map(|cell| cell.chars().count())
+            .chain(std::iter::once(name.len()))
+            .max()
+            .unwrap_or_default();
+        let gap = if chosen.is_empty() { 0 } else { 2 };
+        if used + gap + width_needed > width {
+            break;
+        }
+        used += gap + width_needed;
+        chosen.push(FeedColumn {
+            name,
+            cells,
+            width: width_needed,
+        });
+    }
+    // Line 0 is the header; line n is row n - 1.
+    (0..=rows.len())
+        .map(|line| {
+            chosen
+                .iter()
+                .map(|column| {
+                    let cell = match line {
+                        0 => column.name,
+                        row => column.cells[row - 1].as_str(),
+                    };
+                    format!("{cell:<width$}", width = column.width)
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
+struct FeedColumn<'a> {
+    name: &'a str,
+    cells: Vec<String>,
+    width: usize,
 }
 
 fn panel<'a>(title: &str) -> Block<'a> {
@@ -1276,14 +1521,7 @@ fn draw(frame: &mut Frame, app: &App) {
     .block(panel("NEST HEALTH"));
     frame.render_widget(health, top[0]);
 
-    let lag_ratio = match (&backfill, ready.tip, ready.lag_blocks) {
-        (Some(backfill), _, _) => {
-            let span = backfill.target.saturating_sub(backfill.origin).max(1);
-            backfill.current.saturating_sub(backfill.origin).min(span) as f64 / span as f64
-        }
-        (None, Some(tip), Some(lag)) if tip > 0 => (1.0 - lag as f64 / tip as f64).clamp(0.0, 1.0),
-        _ => 0.0,
-    };
+    let (sync_ratio, sync_label) = app.sync();
     let lifetime = |name| metrics.and_then(|metrics| metric_opt_u64(metrics, name));
     let restarts = match app.last_restart {
         None => "none seen".into(),
@@ -1331,18 +1569,8 @@ fn draw(frame: &mut Frame, app: &App) {
         Gauge::default()
             .block(panel("SYNC POSITION"))
             .gauge_style(Style::default().fg(Color::Magenta))
-            .ratio(lag_ratio)
-            .label(match (&backfill, ready.tip) {
-                (Some(backfill), _) => format!(
-                    "{} / {}",
-                    group_digits(backfill.current),
-                    group_digits(backfill.target)
-                ),
-                (None, Some(tip)) => {
-                    format!("{} / {}", group_digits(ready.last_block), group_digits(tip))
-                }
-                (None, None) => group_digits(ready.last_block),
-            }),
+            .ratio(sync_ratio)
+            .label(sync_label),
         top[2],
     );
 
@@ -1539,10 +1767,24 @@ fn draw(frame: &mut Frame, app: &App) {
                 .collect()
         }
         _ => selection
-            .map(|selection| selection.events.as_slice())
+            .map(|selection| {
+                feed_lines(
+                    &selection.events,
+                    &selection.columns,
+                    bottom[1].width.saturating_sub(4) as usize,
+                )
+            })
             .unwrap_or_default()
-            .iter()
-            .map(|row| ListItem::new(Line::from(event_line(row))))
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let style = if index == 0 {
+                    Style::default().fg(Color::Gray)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(line).style(style)
+            })
             .collect(),
     };
     if show_feed {
@@ -1551,6 +1793,9 @@ fn draw(frame: &mut Frame, app: &App) {
         } else {
             Layout::vertical([Constraint::Percentage(100)]).split(right[1])
         };
+        // Borders and the header line.
+        app.feed_limit
+            .set((feed_area[0].height.saturating_sub(3) as usize).clamp(1, MAX_FEED_ROWS));
         frame.render_widget(
             List::new(feed_rows).block(panel("LIVE EVENT FEED")),
             feed_area[0],
@@ -1627,7 +1872,7 @@ fn draw_activity(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Sparkline::default()
             .block(panel(&format!(
-                "API REFRESH / {span}  peak {} ms",
+                "REFRESH / {span}  peak {} ms",
                 group_digits(refresh.iter().copied().max().unwrap_or_default())
             )))
             .data(&refresh)
@@ -1671,9 +1916,11 @@ mod tests {
                 tables: vec![
                     EventTable {
                         table: "usdc__approval".into(),
+                        columns: Vec::new(),
                     },
                     EventTable {
                         table: "usdc__transfer".into(),
+                        columns: Vec::new(),
                     },
                 ],
             },
@@ -1709,9 +1956,14 @@ mod tests {
         ));
         app.selection = Some(Selection {
             table: "usdc__approval".into(),
+            columns: ["owner", "spender", "value"].map(String::from).to_vec(),
             rows: Some(2275),
             latest_block: Some(25_766_811),
-            events: Vec::new(),
+            events: serde_json::from_str(
+                r#"[{"block_number":25766811,"owner":"0x9fad00000000000000000000000000000000043a9","spender":"0x4cd00000000000000000000000000000000000bc31","value":"115792089237316195423570985008687907853269984665640564039457584007913129639935"},
+                    {"block_number":25766810,"owner":"0x3e8100000000000000000000000000000000bd36","spender":"0xee3900000000000000000000000000000000063b5","value":"1500000000"}]"#,
+            )
+            .expect("fixture rows"),
             degraded: false,
         });
         app.refresh_time = Some(Duration::from_millis(12));
@@ -1729,6 +1981,7 @@ mod tests {
                 rpc_requests: Some(300),
                 rpc_methods: Some(340),
                 indexed_block: Some(25_766_741),
+                tip: Some(25_766_806),
                 cpu_seconds: Some(2.4),
             },
             Sample {
@@ -1737,6 +1990,7 @@ mod tests {
                 rpc_requests: Some(367),
                 rpc_methods: Some(412),
                 indexed_block: Some(25_766_811),
+                tip: Some(25_766_811),
                 cpu_seconds: Some(4.5),
             },
         ];
@@ -1815,6 +2069,9 @@ mod tests {
             "Latest  25,766,811",
             "Storage integrity: healthy",
             "LIVE EVENT FEED",
+            "block       owner        spender      value",
+            "25,766,811  0x9fad…43a9  0x4cd0…bc31  1.15e77",
+            "25,766,810  0x3e81…bd36  0xee39…63b5  1,500,000,000",
         ] {
             assert!(
                 screen.contains(expected),
@@ -1838,8 +2095,8 @@ mod tests {
     /// does. Asserting the boundary keeps that sentence honest.
     #[test]
     fn the_sparkline_arrives_at_thirty_three_rows() {
-        assert!(!rendered(100, 32).contains("API REFRESH /"));
-        assert!(rendered(100, 33).contains("API REFRESH /"));
+        assert!(!rendered(100, 32).contains("REFRESH /"));
+        assert!(rendered(100, 33).contains("REFRESH /"));
     }
 
     /// At 80x24 there is no room for both the panel and the feed. The feed is what gives way: a
@@ -1898,6 +2155,7 @@ mod tests {
             tables: (0..count)
                 .map(|index| EventTable {
                     table: format!("graph__table_{index:03}"),
+                    columns: Vec::new(),
                 })
                 .collect(),
         };
@@ -1926,13 +2184,150 @@ mod tests {
     #[test]
     fn paging_and_the_ends_clamp_to_the_list() {
         let mut app = with_many_tables(81);
-        assert_eq!(app.select(usize::MAX).as_deref(), Some("graph__table_080"));
-        assert_eq!(app.select(app.selected_table + TABLE_PAGE), None);
-        assert_eq!(app.select(0).as_deref(), Some("graph__table_000"));
-        assert_eq!(app.select_previous().as_deref(), Some("graph__table_080"));
-        assert_eq!(app.select_next().as_deref(), Some("graph__table_000"));
+        assert_eq!(
+            app.select(usize::MAX).map(|query| query.table).as_deref(),
+            Some("graph__table_080")
+        );
+        assert!(app.select(app.selected_table + TABLE_PAGE).is_none());
+        assert_eq!(
+            app.select(0).map(|query| query.table).as_deref(),
+            Some("graph__table_000")
+        );
+        assert_eq!(
+            app.select_previous().map(|query| query.table).as_deref(),
+            Some("graph__table_080")
+        );
+        assert_eq!(
+            app.select_next().map(|query| query.table).as_deref(),
+            Some("graph__table_000")
+        );
         app.identity = None;
-        assert_eq!(app.select_next(), None);
+        assert!(app.select_next().is_none());
+    }
+
+    /// Samples whose tip advances at `blocks_per_second`, a minute apart.
+    fn at_block_rate(app: &mut App, blocks_per_second: u64, lag: u64) {
+        let now = Instant::now();
+        let tip = 500_000_000;
+        for sample in &mut app.samples {
+            sample.tip = Some(tip - blocks_per_second * now.duration_since(sample.at).as_secs());
+        }
+        let ready = app.ready.as_mut().unwrap();
+        ready.tip = Some(tip);
+        ready.lag_blocks = Some(lag);
+        ready.last_block = tip - lag;
+    }
+
+    #[test]
+    fn the_gauge_measures_lag_against_a_poll_on_a_slow_chain() {
+        let mut app = populated();
+        assert_eq!(app.sync(), (1.0, "at tip".into()));
+        // Mainnet-ish: five blocks in the minute between samples, so a 2 s poll trails by one.
+        at_block_rate(&mut app, 0, 2);
+        app.samples[0].tip = app.samples[1].tip.map(|tip| tip - 5);
+        assert_eq!(app.sync(), (0.5, "2 blocks · 24s behind".into()));
+    }
+
+    #[test]
+    fn the_gauge_measures_lag_against_a_poll_on_a_fast_chain() {
+        let mut app = populated();
+        app.ready.as_mut().unwrap().freshness = Some(Freshness {
+            poll_interval_secs: Some(300),
+        });
+        // Arbitrum-ish: four blocks a second, and a five-minute cursor trails by ~1,200 by design.
+        at_block_rate(&mut app, 4, 1_100);
+        assert_eq!(app.sync().0, 1.0);
+        at_block_rate(&mut app, 4, 331_434);
+        let (ratio, label) = app.sync();
+        assert!(ratio < 0.01, "{ratio}");
+        assert_eq!(label, "331,434 blocks · 23h behind");
+    }
+
+    #[test]
+    fn the_gauge_without_a_measured_rate_counts_blocks() {
+        let mut app = populated();
+        app.samples.truncate(1);
+        let ready = app.ready.as_mut().unwrap();
+        ready.lag_blocks = Some(4);
+        assert_eq!(app.sync(), (0.25, "4 blocks behind".into()));
+    }
+
+    #[test]
+    fn the_feed_is_a_table_in_schema_order_that_fits_the_width() {
+        // Real rows from `usdc__transfer` on the 3.10.0 demo nest, the second an unlimited amount.
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"_seq":27314306940942,"address":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","block_number":26048953,"from":"0x000000000004444c5dc75cb358380d2e3de08a90","log_index":14,"table":"usdc__transfer","to":"0x4313c378cc91ea583c91387b9216e2c03096b27f","value":"486153178","value_dec":"486153178","value_overflow":false},
+                {"block_number":26048952,"from":"0x9fad0000000000000000000000000000000043a9","to":"0x4cd0000000000000000000000000000000000bc31","value":"115792089237316195423570985008687907853269984665640564039457584007913129639935","value_dec":null,"value_overflow":true}]"#,
+        )
+        .unwrap();
+        let columns = ["from", "to", "value"].map(String::from);
+        assert_eq!(
+            feed_lines(&rows, &columns, 58),
+            [
+                "block       from         to           value",
+                "26,048,953  0x0000…8a90  0x4313…b27f  486,153,178",
+                "26,048,952  0x9fad…43a9  0x4cd0…bc31  1.15e77",
+            ]
+        );
+        assert_eq!(
+            feed_lines(&rows, &columns, 30)[1],
+            "26,048,953  0x0000…8a90"
+        );
+        // Without a column list the first row's own keys are used, less implicit ones and companions.
+        assert_eq!(feed_lines(&rows, &[], 58), feed_lines(&rows, &columns, 58));
+        assert!(feed_lines(&[], &columns, 58).is_empty());
+    }
+
+    #[test]
+    fn long_decimals_turn_scientific_rather_than_vanish() {
+        assert_eq!(format_decimal("486153178"), "486,153,178");
+        assert_eq!(format_decimal("-1000"), "-1,000");
+        assert_eq!(format_decimal("999999999999999"), "999,999,999,999,999");
+        assert_eq!(
+            format_decimal(
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+            ),
+            "1.15e77"
+        );
+    }
+
+    #[test]
+    fn the_feed_query_names_its_columns_and_quotes_them() {
+        let table: EventTable = serde_json::from_str(
+            r#"{"table":"usdc__transfer","columns":[
+                {"name":"block_number","sol_type":"implicit"},{"name":"log_index","sol_type":"implicit"},
+                {"name":"from","sol_type":"address"},{"name":"to","sol_type":"address"},
+                {"name":"value","sol_type":"uint256"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            SelectionQuery::new(&table, 9).events_sql(),
+            "SELECT \"block_number\", \"from\", \"to\", \"value\" FROM \"usdc__transfer\" \
+             ORDER BY block_number DESC, log_index DESC LIMIT 9"
+        );
+        let bare: EventTable = serde_json::from_str(
+            r#"{"table":"t","columns":[{"name":"block_number","sol_type":"implicit"},{"name":"result","sol_type":"bytes"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            SelectionQuery::new(&bare, 6)
+                .events_sql()
+                .ends_with("ORDER BY block_number DESC LIMIT 6")
+        );
+    }
+
+    #[test]
+    fn the_feed_asks_for_as_many_rows_as_the_panel_shows() {
+        let app = populated();
+        render(&app, 100, 30);
+        let short = app.feed_limit.get();
+        render(&app, 100, 50);
+        assert!(
+            app.feed_limit.get() > short,
+            "{short} -> {}",
+            app.feed_limit.get()
+        );
+        assert_eq!(app.poll_request().feed_limit, app.feed_limit.get());
     }
 
     #[test]
@@ -2203,9 +2598,9 @@ mod tests {
             self.apply(poll(client, &self.url, &request));
         }
 
-        fn query(&mut self, client: &Client, table: Option<String>) {
-            if let Some(table) = table {
-                self.apply_selection(fetch_selection(client, &self.url, &table));
+        fn query(&mut self, client: &Client, query: Option<SelectionQuery>) {
+            if let Some(query) = query {
+                self.apply_selection(fetch_selection(client, &self.url, &query));
             }
         }
     }
@@ -2425,7 +2820,7 @@ mod tests {
         });
         let (mut app, client) = nest.app();
         app.refresh(&client);
-        assert_eq!(app.select_next(), None);
+        assert!(app.select_next().is_none());
         assert_eq!(nest.hits("/sql"), 0);
         assert!(app.problems.is_empty(), "{:?}", app.problems);
         let screen = render(&app, 100, 33);
@@ -2446,12 +2841,19 @@ mod tests {
         requests
             .send(Request::Poll(PollRequest {
                 identity: true,
-                table: None,
+                selection: None,
                 sql_open: true,
+                feed_limit: DEFAULT_FEED_ROWS,
             }))
             .unwrap();
         for table in ["usdc__transfer", "usdc__approval", "usdc__transfer"] {
-            requests.send(Request::Selection(table.into())).unwrap();
+            let table = EventTable {
+                table: table.into(),
+                columns: Vec::new(),
+            };
+            requests
+                .send(Request::Selection(SelectionQuery::new(&table, 6)))
+                .unwrap();
         }
         let first = replies.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(first, Reply::Poll(_)));
