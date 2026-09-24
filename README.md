@@ -113,6 +113,16 @@ url = "http://127.0.0.1:18288"
 
 and opened with `--nest allocations`. `--url` and `--ssh` given alongside it take precedence over the entry. Started with none of `--url`, `--ssh` or `--nest`, the client lists the configured nests and opens the one chosen with `Enter`.
 
+Nuthatch serves token amounts in base units and says nothing of their scale, so a nest's entry can declare it. Keys are `table.column`, or a column name alone for every table in the nest:
+
+```toml
+[allocations.decimals]
+"curation__burned.tokens" = 18
+signal = 18
+```
+
+The feed then shows those columns in whole tokens, to four decimal places, truncated (`40.7288` rather than `4.07e19`); an amount too small to show reads `<0.0001`. Columns with no entry stay in base units, because a guessed scale would be a wrong number shown with confidence.
+
 ### Runtimes
 
 Pointed at the root of a runtime (`nuthatch dev` over a `mounts.toml`), the client finds the roster at `/nests` and opens the first mounted nest under its prefix. `n` and `N` step through the others; each switch starts the dashboard afresh, because counters and rates belong to one nest. The header names the runtime, which nest is showing, and how many of its nests are quarantined. A runtime's root `/ready` carries no heights, so it is never read as a nest's.

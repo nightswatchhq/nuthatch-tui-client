@@ -513,6 +513,7 @@ struct App {
     poll_in_flight: bool,
     /// Set when the URL given was a runtime's root; `url` is then the mounted nest being shown.
     runtime: Option<Runtime>,
+    decimals: BTreeMap<String, u32>,
     /// Narrows the table list to names containing it, case-insensitively.
     filter: String,
     /// Keys are going into the filter rather than driving the dashboard.
@@ -547,6 +548,7 @@ impl App {
             last_refresh: None,
             poll_in_flight: false,
             runtime: None,
+            decimals: BTreeMap::new(),
             filter: String::new(),
             filtering: false,
             should_quit: false,
@@ -1131,6 +1133,11 @@ struct Args {
 struct NestTarget {
     url: Option<String>,
     ssh: Option<String>,
+    /// Token decimals for amount columns, keyed `table.column` or by column name for every table.
+    /// Nuthatch serves amounts in base units and says nothing of their scale, so this is the
+    /// operator's to declare.
+    #[serde(default)]
+    decimals: BTreeMap<String, u32>,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -1166,6 +1173,7 @@ fn resolve(args: &Args, nests: &BTreeMap<String, NestTarget>) -> Result<NestTarg
                 .unwrap_or_else(|| DEFAULT_URL.into()),
         )),
         ssh: args.ssh.clone().or(named.ssh),
+        decimals: named.decimals,
     })
 }
 
@@ -1224,6 +1232,7 @@ fn main() -> Result<()> {
         app.target = format!("{nest_url} via {host}");
     }
     app.interval_override = args.interval;
+    app.decimals = target.decimals;
     app.no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
 
     let _screen = Screen::enter()?;
@@ -1899,17 +1908,38 @@ fn format_value(value: &Value) -> String {
         Value::String(text) if text.starts_with("0x") && text.len() > 14 => {
             format!("{}…{}", &text[..6], &text[text.len() - 4..])
         }
-        Value::String(text)
-            if !text.is_empty()
-                && text
-                    .trim_start_matches('-')
-                    .bytes()
-                    .all(|b| b.is_ascii_digit()) =>
-        {
-            format_decimal(text)
-        }
+        Value::String(text) if is_decimal(text) => format_decimal(text),
         Value::String(text) => shorten(text, 24),
         other => other.to_string(),
+    }
+}
+
+fn is_decimal(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A base-unit amount shown in whole tokens, to four decimal places, truncated. A non-zero amount
+/// too small to show says so rather than reading as zero.
+fn format_scaled(text: &str, decimals: u32) -> String {
+    const PLACES: usize = 4;
+    let (sign, digits) = text
+        .strip_prefix('-')
+        .map_or(("", text), |rest| ("-", rest));
+    let decimals = decimals as usize;
+    let padded = format!("{digits:0>width$}", width = decimals + 1);
+    let (whole, fraction) = padded.split_at(padded.len() - decimals);
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let shown = fraction[..fraction.len().min(PLACES)].trim_end_matches('0');
+    if whole == "0" && shown.is_empty() && digits.bytes().any(|b| b != b'0') {
+        return format!("{sign}<0.{}1", "0".repeat(PLACES - 1));
+    }
+    let whole = format_decimal(&format!("{sign}{whole}"));
+    if shown.is_empty() || whole.contains('e') {
+        whole
+    } else {
+        format!("{whole}.{shown}")
     }
 }
 
@@ -1933,7 +1963,13 @@ fn format_decimal(text: &str) -> String {
 /// The feed as a small table: column names once in a header, then a line per row, taking columns
 /// in declared order while they fit. A nest that published no column list gets the first row's
 /// own keys, less the implicit ones and the big-integer companions.
-fn feed_lines(rows: &[Value], columns: &[String], width: usize) -> Vec<String> {
+fn feed_lines(
+    rows: &[Value],
+    table: &str,
+    columns: &[String],
+    decimals: &BTreeMap<String, u32>,
+    width: usize,
+) -> Vec<String> {
     let rows: Vec<_> = rows.iter().filter_map(Value::as_object).collect();
     let Some(first) = rows.first() else {
         return Vec::new();
@@ -1963,9 +1999,19 @@ fn feed_lines(rows: &[Value], columns: &[String], width: usize) -> Vec<String> {
     let mut chosen: Vec<FeedColumn> = Vec::new();
     let mut used = 0;
     let named = names.into_iter().map(|name| {
+        let scale = decimals
+            .get(&format!("{table}.{name}"))
+            .or_else(|| decimals.get(name))
+            .copied();
         let cells: Vec<String> = rows
             .iter()
-            .map(|row| row.get(name).map_or("—".into(), format_value))
+            .map(|row| match (row.get(name), scale) {
+                (Some(Value::String(text)), Some(scale)) if is_decimal(text) => {
+                    format_scaled(text, scale)
+                }
+                (Some(value), _) => format_value(value),
+                (None, _) => "—".into(),
+            })
             .collect();
         (name, cells)
     });
@@ -2445,7 +2491,9 @@ fn draw(frame: &mut Frame, app: &App) {
             .map(|selection| {
                 feed_lines(
                     &selection.events,
+                    &selection.table,
                     &selection.columns,
+                    &app.decimals,
                     bottom[1].width.saturating_sub(4) as usize,
                 )
             })
@@ -3056,7 +3104,7 @@ mod tests {
         .unwrap();
         let columns = ["from", "to", "value"].map(String::from);
         assert_eq!(
-            feed_lines(&rows, &columns, 58),
+            feed_lines(&rows, "usdc__transfer", &columns, &BTreeMap::new(), 58),
             [
                 "block       from         to           value",
                 "26,048,953  0x0000…8a90  0x4313…b27f  486,153,178",
@@ -3064,12 +3112,15 @@ mod tests {
             ]
         );
         assert_eq!(
-            feed_lines(&rows, &columns, 30)[1],
+            feed_lines(&rows, "usdc__transfer", &columns, &BTreeMap::new(), 30)[1],
             "26,048,953  0x0000…8a90"
         );
         // Without a column list the first row's own keys are used, less implicit ones and companions.
-        assert_eq!(feed_lines(&rows, &[], 58), feed_lines(&rows, &columns, 58));
-        assert!(feed_lines(&[], &columns, 58).is_empty());
+        assert_eq!(
+            feed_lines(&rows, "usdc__transfer", &[], &BTreeMap::new(), 58),
+            feed_lines(&rows, "usdc__transfer", &columns, &BTreeMap::new(), 58)
+        );
+        assert!(feed_lines(&[], "usdc__transfer", &columns, &BTreeMap::new(), 58).is_empty());
     }
 
     #[test]
@@ -3083,6 +3134,55 @@ mod tests {
             ),
             "1.15e77"
         );
+    }
+
+    #[test]
+    fn amounts_scale_by_declared_decimals() {
+        assert_eq!(format_scaled("40700000000000000000", 18), "40.7");
+        assert_eq!(format_scaled("2970000000000000000000", 18), "2,970");
+        assert_eq!(
+            format_scaled("486153178", 6),
+            "486.1531",
+            "truncated, not rounded"
+        );
+        assert_eq!(format_scaled("5", 6), "<0.0001");
+        assert_eq!(format_scaled("0", 18), "0");
+        assert_eq!(format_scaled("-1500000", 6), "-1.5");
+        assert_eq!(format_scaled("1500000", 0), "1,500,000");
+        assert_eq!(
+            format_scaled(
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                6
+            ),
+            "1.15e71"
+        );
+    }
+
+    #[test]
+    fn decimals_apply_by_table_and_column_or_by_column_alone() {
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"block_number":508518993,"curator":"0xec9a00000000000000000000000000000003bec","tokens":"40700000000000000000","signal":"12000000000000000000"}]"#,
+        )
+        .unwrap();
+        let columns = ["curator", "tokens", "signal"].map(String::from);
+        let decimals = BTreeMap::from([
+            ("curation__burned.tokens".to_owned(), 18),
+            ("signal".to_owned(), 18),
+        ]);
+        assert_eq!(
+            feed_lines(&rows, "curation__burned", &columns, &decimals, 80)[1],
+            "508,518,993  0xec9a…3bec  40.7    12"
+        );
+        assert_eq!(
+            feed_lines(&rows, "curation__collected", &columns, &decimals, 80)[1],
+            "508,518,993  0xec9a…3bec  4.07e19  12",
+            "a table-qualified key applies to that table only"
+        );
+        let nests = parse_nests(
+            "[allocations]\nurl = \"http://127.0.0.1:8107\"\n\n[allocations.decimals]\n\"curation__burned.tokens\" = 18\n",
+        )
+        .unwrap();
+        assert_eq!(nests["allocations"].decimals["curation__burned.tokens"], 18);
     }
 
     #[test]
@@ -3218,6 +3318,7 @@ mod tests {
             NestTarget {
                 url: Some("http://127.0.0.1:8107".into()),
                 ssh: Some("89.167.109.4".into()),
+                ..NestTarget::default()
             }
         );
         assert_eq!(
@@ -3233,6 +3334,7 @@ mod tests {
             NestTarget {
                 url: Some("http://127.0.0.1:8095".into()),
                 ssh: Some("nbg1".into()),
+                ..NestTarget::default()
             }
         );
         assert_eq!(
@@ -3615,13 +3717,25 @@ mod tests {
 
     /// Prints the dashboard as drawn against a real nest, which is how the README's sample screen
     /// is made: `NUTHATCH_URL=http://127.0.0.1:18288 cargo test live -- --ignored --nocapture`.
-    /// With `NUTHATCH_SSH=host` it goes through a forward, as `--ssh` does.
+    /// `NUTHATCH_SSH=host` goes through a forward, as `--ssh` does, and `NUTHATCH_NEST=name` takes
+    /// everything from `nests.toml`, as `--nest` does.
     #[test]
-    #[ignore = "needs a running nest at NUTHATCH_URL"]
+    #[ignore = "needs a running nest at NUTHATCH_URL or NUTHATCH_NEST"]
     fn live() {
-        let url = normalize_url(std::env::var("NUTHATCH_URL").expect("NUTHATCH_URL"));
-        let tunnel = std::env::var("NUTHATCH_SSH").ok().map(|host| {
-            Tunnel::open("ssh", &host, &url, &AtomicBool::new(false)).expect("ssh forward")
+        let args = Args {
+            url: std::env::var("NUTHATCH_URL").ok(),
+            ssh: std::env::var("NUTHATCH_SSH").ok(),
+            nest: std::env::var("NUTHATCH_NEST").ok(),
+            interval: None,
+        };
+        let nests = config_path()
+            .filter(|path| path.exists())
+            .map(|path| parse_nests(&std::fs::read_to_string(path).unwrap()).unwrap())
+            .unwrap_or_default();
+        let target = resolve(&args, &nests).unwrap();
+        let url = target.url.clone().unwrap();
+        let tunnel = target.ssh.as_ref().map(|host| {
+            Tunnel::open("ssh", host, &url, &AtomicBool::new(false)).expect("ssh forward")
         });
         let client = Client::builder()
             .timeout(Duration::from_secs(3))
@@ -3632,6 +3746,7 @@ mod tests {
                 .as_ref()
                 .map_or_else(|| url.clone(), |tunnel| tunnel.local_url.clone()),
         );
+        app.decimals = target.decimals;
         for _ in 0..6 {
             app.refresh(&client);
             std::thread::sleep(app.poll_interval());
