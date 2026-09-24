@@ -1171,38 +1171,6 @@ fn resolve(args: &Args, nests: &BTreeMap<String, NestTarget>) -> Result<NestTarg
 
 fn main() -> Result<()> {
     let args = parse_args(std::env::args().skip(1))?;
-    let nests = match config_path() {
-        Some(path) if path.exists() => parse_nests(
-            &std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?,
-        )
-        .with_context(|| format!("parsing {}", path.display()))?,
-        _ => BTreeMap::new(),
-    };
-    let target = resolve(&args, &nests)?;
-    let nest_url = target.url.expect("resolve always sets a url");
-    let client = Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .context("building HTTP client")?;
-    let tunnel = match &target.ssh {
-        Some(host) => {
-            eprintln!("opening an ssh forward to {nest_url} on {host}…");
-            Some(Tunnel::open("ssh", host, &nest_url)?)
-        }
-        None => None,
-    };
-    let mut app = App::new(
-        tunnel
-            .as_ref()
-            .map_or_else(|| nest_url.clone(), |tunnel| tunnel.local_url.clone()),
-    );
-    if let Some(host) = &target.ssh {
-        app.target = format!("{nest_url} via {host}");
-    }
-    app.interval_override = args.interval;
-    app.no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-
     let quit = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     for signal in [
@@ -1219,9 +1187,147 @@ fn main() -> Result<()> {
         default_hook(info);
     }));
 
+    let nests = match config_path() {
+        Some(path) if path.exists() => parse_nests(
+            &std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", path.display()))?,
+        _ => BTreeMap::new(),
+    };
+    let mut args = args;
+    if args.url.is_none() && args.ssh.is_none() && args.nest.is_none() && !nests.is_empty() {
+        match pick_nest(&nests, &quit)? {
+            Some(name) => args.nest = Some(name),
+            None => return Ok(()),
+        }
+    }
+    let target = resolve(&args, &nests)?;
+    let nest_url = target.url.expect("resolve always sets a url");
+    let client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("building HTTP client")?;
+    let tunnel = match &target.ssh {
+        Some(host) => {
+            eprintln!("opening an ssh forward to {nest_url} on {host}…");
+            Some(Tunnel::open("ssh", host, &nest_url, &quit)?)
+        }
+        None => None,
+    };
+    let mut app = App::new(
+        tunnel
+            .as_ref()
+            .map_or_else(|| nest_url.clone(), |tunnel| tunnel.local_url.clone()),
+    );
+    if let Some(host) = &target.ssh {
+        app.target = format!("{nest_url} via {host}");
+    }
+    app.interval_override = args.interval;
+    app.no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+
     let _screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     run(&mut terminal, client, &mut app, tunnel, &quit)
+}
+
+/// The list shown when `nests.toml` names nests and the command line names none.
+struct Picker {
+    names: Vec<String>,
+    lines: Vec<String>,
+    selected: usize,
+}
+
+enum Picked {
+    Nest(String),
+    Quit,
+}
+
+impl Picker {
+    fn new(nests: &BTreeMap<String, NestTarget>) -> Self {
+        let width = nests.keys().map(String::len).max().unwrap_or_default();
+        Self {
+            names: nests.keys().cloned().collect(),
+            lines: nests
+                .iter()
+                .map(|(name, nest)| {
+                    let url = nest.url.as_deref().unwrap_or(DEFAULT_URL);
+                    match &nest.ssh {
+                        Some(host) => format!("{name:<width$}  {url} via {host}"),
+                        None => format!("{name:<width$}  {url}"),
+                    }
+                })
+                .collect(),
+            selected: 0,
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Option<Picked> {
+        let last = self.names.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Some(Picked::Quit);
+            }
+            KeyCode::Char('q') | KeyCode::Esc => return Some(Picked::Quit),
+            KeyCode::Enter => return self.names.get(self.selected).cloned().map(Picked::Nest),
+            KeyCode::Down | KeyCode::Char('j') => self.selected = (self.selected + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Home | KeyCode::Char('g') => self.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => self.selected = last,
+            _ => {}
+        }
+        None
+    }
+
+    fn draw(&self, frame: &mut Frame, no_color: bool) {
+        let area = frame.area();
+        frame.render_widget(Block::default().style(Style::default().bg(CANVAS)), area);
+        let rows: Vec<ListItem> = self
+            .lines
+            .iter()
+            .map(|line| ListItem::new(line.as_str()).style(Style::default().fg(Color::White)))
+            .collect();
+        let mut state = ListState::default().with_selected(Some(self.selected));
+        let height = (self.lines.len() as u16 + 2).min(area.height);
+        let [list] = Layout::vertical([Constraint::Length(height)])
+            .flex(layout::Flex::Center)
+            .areas(area);
+        frame.render_stateful_widget(
+            List::new(rows)
+                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+                .block(panel("CHOOSE A NEST  ↑↓  enter  q")),
+            list,
+            &mut state,
+        );
+        if no_color {
+            strip_colour(frame.buffer_mut());
+        }
+    }
+}
+
+/// Runs the picker in a screen session of its own, released before the chosen nest's tunnel is
+/// opened, so anything ssh prints lands on the ordinary terminal rather than over the dashboard.
+fn pick_nest(nests: &BTreeMap<String, NestTarget>, quit: &AtomicBool) -> Result<Option<String>> {
+    let mut picker = Picker::new(nests);
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let _screen = Screen::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    loop {
+        terminal.draw(|frame| picker.draw(frame, no_color))?;
+        if quit.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match picker.handle_key(key) {
+                Some(Picked::Nest(name)) => return Ok(Some(name)),
+                Some(Picked::Quit) => return Ok(None),
+                None => {}
+            }
+        }
+    }
 }
 
 /// An `ssh -N -L` forward to a nest that listens only on another host's loopback. `BatchMode`
@@ -1242,7 +1348,7 @@ struct Tunnel {
 }
 
 impl Tunnel {
-    fn open(program: &str, host: &str, nest_url: &str) -> Result<Self> {
+    fn open(program: &str, host: &str, nest_url: &str, quit: &AtomicBool) -> Result<Self> {
         let mut url =
             reqwest::Url::parse(nest_url).with_context(|| format!("'{nest_url}' is not a URL"))?;
         let remote_host = url
@@ -1271,14 +1377,15 @@ impl Tunnel {
             retry_at: None,
             last_error: String::new(),
         };
-        tunnel.wait_until_listening(Duration::from_secs(15))?;
+        tunnel.wait_until_listening(Duration::from_secs(15), quit)?;
         Ok(tunnel)
     }
 
-    fn wait_until_listening(&mut self, limit: Duration) -> Result<()> {
+    fn wait_until_listening(&mut self, limit: Duration, quit: &AtomicBool) -> Result<()> {
         let started = Instant::now();
         let address = ([127, 0, 0, 1], self.local_port).into();
         loop {
+            anyhow::ensure!(!quit.load(Ordering::Relaxed), "interrupted");
             if let Some(status) = self.child.try_wait()? {
                 let reason = self.stderr();
                 anyhow::bail!("ssh to {} exited ({status}): {reason}", self.host);
@@ -3090,6 +3197,50 @@ mod tests {
     }
 
     #[test]
+    fn the_picker_lists_the_configured_nests_and_returns_the_chosen_one() {
+        let nests = parse_nests(NESTS).unwrap();
+        let mut picker = Picker::new(&nests);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| picker.draw(frame, false)).unwrap();
+        let screen: String = format!("{:?}", terminal.backend().buffer());
+        for expected in [
+            "CHOOSE A NEST",
+            "allocations  http://127.0.0.1:8107 via 89.167.109.4",
+            "local        http://127.0.0.1:18288",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} missing:\n{screen}");
+        }
+        let key = |code| KeyEvent::from(code);
+        assert!(picker.handle_key(key(KeyCode::Char('j'))).is_none());
+        assert!(
+            picker.handle_key(key(KeyCode::Char('j'))).is_none(),
+            "clamps at the end"
+        );
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            Some(Picked::Nest(name)) if name == "local"
+        ));
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('q'))),
+            Some(Picked::Quit)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_stops_the_wait_for_a_tunnel() {
+        let error = Tunnel::open(
+            &fake_ssh(false),
+            "hel1",
+            "http://127.0.0.1:8107",
+            &AtomicBool::new(true),
+        )
+        .err()
+        .expect("an interrupted open fails");
+        assert_eq!(error.to_string(), "interrupted");
+    }
+
+    #[test]
     fn ssh_is_asked_for_a_batch_mode_forward_that_fails_loudly() {
         let args = ssh_args("hel1", "127.0.0.1:40000:127.0.0.1:8107");
         assert_eq!(args.last().map(String::as_str), Some("hel1"));
@@ -3145,6 +3296,7 @@ mod tests {
             &fake_ssh(false),
             "hel1",
             "http://127.0.0.1:8107/allocations",
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(
@@ -3157,9 +3309,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_refused_key_is_reported_before_the_dashboard_opens() {
-        let error = Tunnel::open(&fake_ssh(true), "hel1", "http://127.0.0.1:8107")
-            .err()
-            .expect("a refused key must not open");
+        let error = Tunnel::open(
+            &fake_ssh(true),
+            "hel1",
+            "http://127.0.0.1:8107",
+            &AtomicBool::new(false),
+        )
+        .err()
+        .expect("a refused key must not open");
         let message = error.to_string();
         assert!(
             message.contains("Permission denied (publickey)."),
@@ -3170,7 +3327,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_dead_tunnel_is_reported_and_reopened() {
-        let mut tunnel = Tunnel::open(&fake_ssh(false), "hel1", "http://127.0.0.1:8107").unwrap();
+        let mut tunnel = Tunnel::open(
+            &fake_ssh(false),
+            "hel1",
+            "http://127.0.0.1:8107",
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(tunnel.supervise(), None);
         tunnel.child.kill().unwrap();
         tunnel.child.wait().unwrap();
@@ -3183,7 +3346,7 @@ mod tests {
             Some("ssh to hel1: reopening the forward")
         );
         tunnel
-            .wait_until_listening(Duration::from_secs(10))
+            .wait_until_listening(Duration::from_secs(10), &AtomicBool::new(false))
             .unwrap();
         assert_eq!(tunnel.supervise(), None);
         assert_eq!(
@@ -3393,9 +3556,9 @@ mod tests {
     #[ignore = "needs a running nest at NUTHATCH_URL"]
     fn live() {
         let url = normalize_url(std::env::var("NUTHATCH_URL").expect("NUTHATCH_URL"));
-        let tunnel = std::env::var("NUTHATCH_SSH")
-            .ok()
-            .map(|host| Tunnel::open("ssh", &host, &url).expect("ssh forward"));
+        let tunnel = std::env::var("NUTHATCH_SSH").ok().map(|host| {
+            Tunnel::open("ssh", &host, &url, &AtomicBool::new(false)).expect("ssh forward")
+        });
         let client = Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
