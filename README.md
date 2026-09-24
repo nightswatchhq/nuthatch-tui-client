@@ -101,8 +101,9 @@ cargo run --release -- --url http://127.0.0.1:8288
 | `Up` / `Down` or `k` / `j` | Select an event table and refresh its summary and event feed. |
 | `PageUp` / `PageDown` | Move the selection ten tables. |
 | `Home` / `End` or `g` / `G` | Jump to the first or last table. |
+| `/` | Filter the table list by name, case-insensitively. `Enter` keeps the filter, `Esc` drops it; while typing, letters are text rather than commands. |
 | `w` | Cycle the rolling-rate window: 15, 60, or 90 seconds. |
-| `q`, `Esc` or `Ctrl-C` | Exit cleanly. |
+| `q`, `Esc` or `Ctrl-C` | Exit cleanly. With a filter standing, the first `Esc` clears it instead. |
 
 The terminal is restored on `SIGTERM`, `SIGHUP` and `SIGINT` as well as on a normal exit or a panic.
 

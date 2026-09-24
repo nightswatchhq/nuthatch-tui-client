@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::Show,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -438,6 +438,10 @@ struct App {
     refresh_time: Option<Duration>,
     last_refresh: Option<Instant>,
     poll_in_flight: bool,
+    /// Narrows the table list to names containing it, case-insensitively.
+    filter: String,
+    /// Keys are going into the filter rather than driving the dashboard.
+    filtering: bool,
     should_quit: bool,
 }
 
@@ -465,6 +469,8 @@ impl App {
             refresh_time: None,
             last_refresh: None,
             poll_in_flight: false,
+            filter: String::new(),
+            filtering: false,
             should_quit: false,
         }
     }
@@ -641,14 +647,123 @@ impl App {
         self.selection_query()
     }
 
+    /// Indices into the full table list of the tables the filter lets through.
+    fn visible_tables(&self) -> Vec<usize> {
+        let filter = self.filter.to_lowercase();
+        self.identity
+            .as_ref()
+            .map(|identity| identity.tables.tables.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .filter(|(_, table)| table.table.to_lowercase().contains(&filter))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn visible_position(&self) -> Option<usize> {
+        self.visible_tables()
+            .iter()
+            .position(|index| *index == self.selected_table)
+    }
+
+    fn select_visible(&mut self, position: usize) -> Option<SelectionQuery> {
+        let visible = self.visible_tables();
+        let index = *visible.get(position.min(visible.len().checked_sub(1)?))?;
+        self.select(index)
+    }
+
     fn select_next(&mut self) -> Option<SelectionQuery> {
-        let count = self.table_count().max(1);
-        self.select((self.selected_table + 1) % count)
+        let count = self.visible_tables().len().max(1);
+        let next = self
+            .visible_position()
+            .map_or(0, |position| (position + 1) % count);
+        self.select_visible(next)
     }
 
     fn select_previous(&mut self) -> Option<SelectionQuery> {
-        let count = self.table_count().max(1);
-        self.select((self.selected_table + count - 1) % count)
+        let count = self.visible_tables().len().max(1);
+        let previous = self
+            .visible_position()
+            .map_or(0, |position| (position + count - 1) % count);
+        self.select_visible(previous)
+    }
+
+    fn select_page(&mut self, forward: bool) -> Option<SelectionQuery> {
+        let position = self.visible_position().unwrap_or_default();
+        self.select_visible(if forward {
+            position.saturating_add(TABLE_PAGE)
+        } else {
+            position.saturating_sub(TABLE_PAGE)
+        })
+    }
+
+    fn set_filter(&mut self, filter: String) -> Option<SelectionQuery> {
+        self.filter = filter;
+        self.table_offset.set(0);
+        if self.visible_position().is_some() {
+            None
+        } else {
+            self.select_visible(0)
+        }
+    }
+
+    /// Applies one keypress and returns the table to query if the selection moved.
+    fn handle_key(&mut self, key: KeyEvent) -> Option<SelectionQuery> {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return None;
+        }
+        match key.code {
+            KeyCode::Down => return self.select_next(),
+            KeyCode::Up => return self.select_previous(),
+            KeyCode::PageDown => return self.select_page(true),
+            KeyCode::PageUp => return self.select_page(false),
+            _ => {}
+        }
+        if self.filtering {
+            return match key.code {
+                KeyCode::Enter => {
+                    self.filtering = false;
+                    None
+                }
+                KeyCode::Esc => {
+                    self.filtering = false;
+                    self.set_filter(String::new())
+                }
+                KeyCode::Backspace => {
+                    let mut filter = self.filter.clone();
+                    filter.pop();
+                    self.set_filter(filter)
+                }
+                KeyCode::Char(typed) => self.set_filter(format!("{}{typed}", self.filter)),
+                _ => None,
+            };
+        }
+        match key.code {
+            KeyCode::Char('/') => {
+                self.filtering = true;
+                None
+            }
+            KeyCode::Esc if !self.filter.is_empty() => self.set_filter(String::new()),
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.should_quit = true;
+                None
+            }
+            KeyCode::Char('r') => {
+                self.last_refresh = None;
+                None
+            }
+            KeyCode::Char('w') => {
+                self.cycle_rate_window();
+                None
+            }
+            KeyCode::Char('j') => self.select_next(),
+            KeyCode::Char('k') => self.select_previous(),
+            KeyCode::Home | KeyCode::Char('g') => self.select_visible(0),
+            KeyCode::End | KeyCode::Char('G') => self.select_visible(usize::MAX),
+            _ => None,
+        }
     }
 
     fn table_count(&self) -> usize {
@@ -976,31 +1091,7 @@ fn run<B: Backend>(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            let query = match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.should_quit = true;
-                    None
-                }
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    app.should_quit = true;
-                    None
-                }
-                KeyCode::Char('r') => {
-                    app.last_refresh = None;
-                    None
-                }
-                KeyCode::Char('w') => {
-                    app.cycle_rate_window();
-                    None
-                }
-                KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
-                KeyCode::PageDown => app.select(app.selected_table.saturating_add(TABLE_PAGE)),
-                KeyCode::PageUp => app.select(app.selected_table.saturating_sub(TABLE_PAGE)),
-                KeyCode::Home | KeyCode::Char('g') => app.select(0),
-                KeyCode::End | KeyCode::Char('G') => app.select(usize::MAX),
-                _ => None,
-            };
+            let query = app.handle_key(key);
             if let Some(table) = query {
                 send(Request::Selection(table))?;
             }
@@ -1594,24 +1685,37 @@ fn draw(frame: &mut Frame, app: &App) {
     let tables = identity
         .map(|identity| identity.tables.tables.as_slice())
         .unwrap_or_default();
-    let rows: Vec<ListItem> = tables
+    let visible = app.visible_tables();
+    let rows: Vec<ListItem> = visible
         .iter()
-        .map(|table| ListItem::new(table.table.as_str()).style(Style::default().fg(Color::White)))
+        .map(|index| {
+            ListItem::new(tables[*index].table.as_str()).style(Style::default().fg(Color::White))
+        })
         .collect();
+    let position = app.visible_position();
     let mut list_state = ListState::default()
         .with_offset(app.table_offset.get())
-        .with_selected((!tables.is_empty()).then_some(app.selected_table));
+        .with_selected(position);
+    let filter = match (app.filtering, app.filter.is_empty()) {
+        (true, _) => format!("  /{}▏", app.filter),
+        (false, false) => format!("  /{}", app.filter),
+        (false, true) => String::new(),
+    };
+    let title = match (tables.is_empty(), position, visible.is_empty()) {
+        (true, _, _) => "INDEXED TABLES".to_owned(),
+        (false, _, true) => format!("INDEXED TABLES{filter}  no match"),
+        (false, Some(position), false) => {
+            format!("INDEXED TABLES{filter}  {}/{}", position + 1, visible.len())
+        }
+        (false, None, false) => format!("INDEXED TABLES{filter}  {}", visible.len()),
+    };
     frame.render_stateful_widget(
         List::new(rows)
             .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
-            .block(panel(&if tables.is_empty() {
-                "INDEXED TABLES".to_owned()
+            .block(panel(&if filter.is_empty() && !tables.is_empty() {
+                format!("{title}  ↑↓ j k")
             } else {
-                format!(
-                    "INDEXED TABLES  {}/{}  ↑↓ j k",
-                    app.selected_table + 1,
-                    tables.len()
-                )
+                title
             })),
         left[0],
         &mut list_state,
@@ -1810,22 +1914,27 @@ fn draw(frame: &mut Frame, app: &App) {
             " q ",
             Style::default().fg(Color::Black).bg(Color::Gray).bold(),
         ),
-        Span::raw(" quit   "),
+        Span::raw(" quit  "),
         Span::styled(
             " r ",
             Style::default().fg(Color::Black).bg(Color::Gray).bold(),
         ),
-        Span::raw(" refresh   "),
+        Span::raw(" refresh  "),
         Span::styled(
             " ↑↓ ",
             Style::default().fg(Color::Black).bg(Color::Gray).bold(),
         ),
-        Span::raw(" tables   "),
+        Span::raw(" tables  "),
         Span::styled(
             " w ",
             Style::default().fg(Color::Black).bg(Color::Gray).bold(),
         ),
-        Span::raw(" rate window   "),
+        Span::raw(" window  "),
+        Span::styled(
+            " / ",
+            Style::default().fg(Color::Black).bg(Color::Gray).bold(),
+        ),
+        Span::raw(" filter  "),
         Span::styled(
             app.status(),
             Style::default().fg(if app.problems.is_empty() {
@@ -2080,6 +2189,21 @@ mod tests {
         }
     }
 
+    /// The status is the part of the footer that changes, so a failure has to be readable whole.
+    #[test]
+    fn the_footer_leaves_room_for_a_failure_at_one_hundred_columns() {
+        let mut app = populated();
+        app.problems = vec![("/metrics", "HTTP 404 Not Found".into())];
+        let screen = render(&app, 100, 30);
+        assert!(
+            screen
+                .lines()
+                .find(|line| line.contains("q  quit"))
+                .is_some_and(|footer| footer.contains("/metrics: HTTP 404 Not Found")),
+            "{screen}"
+        );
+    }
+
     #[test]
     fn the_marker_survives_a_long_url_at_one_hundred_columns() {
         let mut app = populated();
@@ -2179,6 +2303,93 @@ mod tests {
             offset,
             "moving up inside the view should not scroll it"
         );
+    }
+
+    /// Types `keys` and returns the last selection they moved to, if any did.
+    fn press(app: &mut App, keys: &str) -> Option<SelectionQuery> {
+        keys.chars()
+            .map(|key| {
+                app.handle_key(KeyEvent::from(match key {
+                    '\n' => KeyCode::Enter,
+                    '\x1b' => KeyCode::Esc,
+                    '\x08' => KeyCode::Backspace,
+                    other => KeyCode::Char(other),
+                }))
+            })
+            .fold(None, |moved, query| query.or(moved))
+    }
+
+    fn allocations_nest() -> App {
+        let mut app = with_many_tables(0);
+        let names = [
+            "curation__burned",
+            "staking__allocation_closed",
+            "staking__stake_deposited",
+            "subgraph_service__allocation_closed",
+            "subgraph_service__allocation_created",
+            "total_supply",
+        ];
+        app.identity.as_mut().unwrap().tables = Tables {
+            count: names.len(),
+            tables: names
+                .iter()
+                .map(|name| EventTable {
+                    table: (*name).into(),
+                    columns: Vec::new(),
+                })
+                .collect(),
+        };
+        app
+    }
+
+    #[test]
+    fn typing_a_filter_narrows_the_list_and_moves_the_selection_into_it() {
+        let mut app = allocations_nest();
+        let query = press(&mut app, "/ALLOC");
+        assert_eq!(
+            query.map(|query| query.table).as_deref(),
+            Some("staking__allocation_closed")
+        );
+        assert_eq!(app.visible_tables(), [1, 3, 4]);
+        // Letters that are also commands are text while filtering.
+        press(&mut app, "q");
+        assert!(!app.should_quit);
+        assert!(app.visible_tables().is_empty());
+        let screen = render(&app, 100, 30);
+        assert!(
+            screen.contains("INDEXED TABLES  /ALLOCq▏  no match"),
+            "{screen}"
+        );
+        press(&mut app, "\x08\n");
+        assert!(!app.filtering);
+        assert_eq!(
+            press(&mut app, "j").map(|query| query.table).as_deref(),
+            Some("subgraph_service__allocation_closed")
+        );
+        assert_eq!(
+            press(&mut app, "jj").map(|query| query.table).as_deref(),
+            Some("staking__allocation_closed"),
+            "j wraps within the filtered tables"
+        );
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains("INDEXED TABLES  /ALLOC  1/3"), "{screen}");
+        assert!(!screen.contains("curation__burned"), "{screen}");
+        // Esc clears a standing filter first, and only then quits.
+        press(&mut app, "\x1b");
+        assert_eq!(app.visible_tables().len(), 6);
+        assert!(!app.should_quit);
+        press(&mut app, "\x1b");
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn esc_while_typing_abandons_the_filter() {
+        let mut app = allocations_nest();
+        press(&mut app, "/total\x1b");
+        assert!(!app.filtering);
+        assert!(app.filter.is_empty());
+        assert_eq!(app.selected_table_name(), Some("total_supply"));
+        assert!(!app.should_quit);
     }
 
     #[test]
