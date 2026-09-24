@@ -87,6 +87,29 @@ The dashboard polls as often as the nest does, taken from `freshness.poll_interv
 
 Set `NO_COLOR` to drop every colour. The selection, key badges and gauge switch to reverse video so that they remain visible.
 
+### Remote nests
+
+A nest on a server is normally bound to its loopback. `--ssh` opens the forward itself, with `--url` giving the nest's address as seen from that host:
+
+```sh
+cargo run -- --ssh 89.167.109.4 --url http://127.0.0.1:8107
+```
+
+The client runs `ssh -N -L` with `BatchMode`, so the host needs key or agent authentication; a password prompt would land in the middle of the dashboard, and a refused key is reported before it opens. If ssh exits mid-session, the footer says why and the forward is reopened after 1, 2, 4 and up to 30 seconds. The ssh process goes when the client does, including on `SIGTERM`.
+
+Nests used often can be named in `~/.config/nuthatch-tui/nests.toml` (or under `$XDG_CONFIG_HOME`):
+
+```toml
+[allocations]
+url = "http://127.0.0.1:8107"
+ssh = "89.167.109.4"
+
+[local]
+url = "http://127.0.0.1:18288"
+```
+
+and opened with `--nest allocations`. `--url` and `--ssh` given alongside it take precedence over the entry.
+
 For an optimised build:
 
 ```sh
@@ -141,7 +164,7 @@ The client uses only public, read-only Nuthatch endpoints:
 
 Requests are made on a thread of their own, so a slow nest delays the numbers and never the keyboard. Selections made while a query is running are collapsed into one query for the last of them.
 
-It makes no HTTP mutation request and never touches the nest's redb or Parquet files. This also means it can run from another machine if the Nuthatch API is intentionally exposed and protected by the operator's normal network controls.
+It makes no HTTP mutation request and never touches the nest's redb or Parquet files. It can watch a nest on another machine through `--ssh`, or directly if the operator has deliberately exposed the API behind their normal network controls.
 
 ## Performance measurements
 
@@ -169,7 +192,7 @@ The dashboard degrades each of these independently rather than displaying a misl
 - It reports request count, not exact provider cost. Billing models differ by provider and method.
 - On Nuthatch before 3.0.0, CPU utilisation is only accurate when the nest itself is Linux-hosted; a Mac-hosted nest reports a flat `0.0%` rather than `unavailable` ([nightswatchhq/nuthatch#844](https://github.com/nightswatchhq/nuthatch/issues/844)).
 - A restart is only seen if it happens while the client is watching, and only if the counters have not climbed past their old values by the next sample. A restart before the client started is invisible to it.
-- A remote Nuthatch endpoint must be deliberately exposed by its operator. The default assumes a localhost service.
+- `--ssh` needs non-interactive authentication to the host. There is no picker yet: a named nest is chosen with `--nest`.
 - The screen wants 100 columns by 30 rows for everything at once. It stays usable smaller, in the order set out under [Terminal size](#terminal-size), but the performance panel's longest lines truncate below 100 columns.
 
 ## Terminal size
