@@ -1,9 +1,11 @@
 use std::{
+    cell::Cell,
     collections::{BTreeMap, VecDeque},
     io,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
     time::{Duration, Instant},
 };
@@ -18,7 +20,8 @@ use crossterm::{
 use ratatui::{
     prelude::*,
     widgets::{
-        Block, BorderType, Borders, Gauge, List, ListItem, Padding, Paragraph, Sparkline, Wrap,
+        Block, BorderType, Borders, Gauge, List, ListItem, ListState, Padding, Paragraph,
+        Sparkline, Wrap,
     },
 };
 use reqwest::{StatusCode, blocking::Client};
@@ -31,6 +34,7 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const HISTORY_LEN: usize = 48;
+const TABLE_PAGE: usize = 10;
 const ACTIVITY_LEN: usize = 64;
 /// How long an observed restart keeps the restart line lit.
 const RECENT_RESTART: Duration = Duration::from_secs(600);
@@ -229,11 +233,103 @@ struct Backfill {
 
 type Problem = (&'static str, String);
 
+/// A poll names the selected table rather than indexing it, so a catalogue refetched after a
+/// restart keeps the operator's place in it.
+struct PollRequest {
+    identity: bool,
+    table: Option<String>,
+    sql_open: bool,
+}
+
+struct PollResult {
+    identity: Option<Result<Identity, Problem>>,
+    ready: Result<Ready, String>,
+    metrics: Result<BTreeMap<String, f64>, String>,
+    table: Option<String>,
+    selection: Option<Result<Selection, String>>,
+    elapsed: Duration,
+}
+
+enum Request {
+    Poll(PollRequest),
+    Selection(String),
+}
+
+enum Reply {
+    Poll(Box<PollResult>),
+    Selection(Result<Selection, String>),
+}
+
+fn poll(client: &Client, base: &str, request: &PollRequest) -> PollResult {
+    let started = Instant::now();
+    let identity = request.identity.then(|| fetch_identity(client, base));
+    let ready = fetch_ready(client, base);
+    let metrics =
+        fetch_ok(client, &format!("{base}/metrics"), &[]).map(|text| parse_prometheus(&text));
+    let (table, sql_open) = match &identity {
+        Some(Ok(identity)) => {
+            let tables = &identity.tables.tables;
+            let table = request
+                .table
+                .clone()
+                .filter(|name| tables.iter().any(|table| table.table == *name))
+                .or_else(|| tables.first().map(|table| table.table.clone()));
+            (table, identity.sql == SqlAccess::Open)
+        }
+        _ => (request.table.clone(), request.sql_open),
+    };
+    let selection = table
+        .as_deref()
+        .filter(|_| sql_open)
+        .map(|table| fetch_selection(client, base, table));
+    PollResult {
+        identity,
+        ready,
+        metrics,
+        table,
+        selection,
+        elapsed: started.elapsed(),
+    }
+}
+
+/// Requests run here so that a slow `/sql` delays the numbers rather than the keyboard.
+fn spawn_worker(client: Client, base: String) -> (Sender<Request>, Receiver<Reply>) {
+    let (requests, inbox) = mpsc::channel();
+    let (outbox, replies) = mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(first) = inbox.recv() {
+            // Holding `j` queues a selection per keypress; only the last one is worth asking for.
+            let (mut next_poll, mut next_selection) = (None, None);
+            for request in std::iter::once(first).chain(inbox.try_iter()) {
+                match request {
+                    Request::Poll(request) => next_poll = Some(request),
+                    Request::Selection(table) => next_selection = Some(table),
+                }
+            }
+            let replies = next_poll
+                .map(|request| Reply::Poll(Box::new(poll(&client, &base, &request))))
+                .into_iter()
+                .chain(
+                    next_selection
+                        .map(|table| Reply::Selection(fetch_selection(&client, &base, &table))),
+                );
+            for reply in replies {
+                if outbox.send(reply).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    (requests, replies)
+}
+
 struct App {
     url: String,
     interval_override: Option<Duration>,
     no_color: bool,
     identity: Option<Identity>,
+    /// Set by an observed restart: the next poll fetches the catalogue again.
+    refetch_identity: bool,
     ready: Option<Ready>,
     /// The last `/ready` failed, so `ready` is the previous answer and everything is stale.
     ready_failed: bool,
@@ -246,8 +342,11 @@ struct App {
     last_restart: Option<Instant>,
     rate_window: usize,
     selected_table: usize,
+    /// The table list's scroll position, kept between frames so moving up does not jerk the view.
+    table_offset: Cell<usize>,
     refresh_time: Option<Duration>,
     last_refresh: Option<Instant>,
+    poll_in_flight: bool,
     should_quit: bool,
 }
 
@@ -258,6 +357,7 @@ impl App {
             interval_override: None,
             no_color: false,
             identity: None,
+            refetch_identity: false,
             ready: None,
             ready_failed: false,
             metrics: None,
@@ -269,32 +369,55 @@ impl App {
             last_restart: None,
             rate_window: 1,
             selected_table: 0,
+            table_offset: Cell::new(0),
             refresh_time: None,
             last_refresh: None,
+            poll_in_flight: false,
             should_quit: false,
         }
     }
 
     fn refresh_due(&self) -> bool {
-        self.last_refresh
-            .is_none_or(|at| at.elapsed() >= self.poll_interval())
+        !self.poll_in_flight
+            && self
+                .last_refresh
+                .is_none_or(|at| at.elapsed() >= self.poll_interval())
     }
 
-    fn refresh(&mut self, client: &Client) {
-        let started = Instant::now();
-        let mut problems = Vec::new();
-        if self.identity.is_none() {
-            match fetch_identity(client, &self.url) {
-                Ok(identity) => {
-                    self.selected_table = self
-                        .selected_table
-                        .min(identity.tables.tables.len().saturating_sub(1));
-                    self.identity = Some(identity);
-                }
-                Err(problem) => problems.push(problem),
-            }
+    fn poll_request(&self) -> PollRequest {
+        PollRequest {
+            identity: self.identity.is_none() || self.refetch_identity,
+            table: self.selected_table_name().map(str::to_owned),
+            sql_open: self
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.sql == SqlAccess::Open),
         }
-        match fetch_ready(client, &self.url) {
+    }
+
+    fn apply(&mut self, result: PollResult) {
+        self.poll_in_flight = false;
+        let mut problems = Vec::new();
+        match result.identity {
+            Some(Ok(identity)) => {
+                self.selected_table = result
+                    .table
+                    .as_deref()
+                    .and_then(|name| {
+                        identity
+                            .tables
+                            .tables
+                            .iter()
+                            .position(|table| table.table == name)
+                    })
+                    .unwrap_or_default();
+                self.identity = Some(identity);
+                self.refetch_identity = false;
+            }
+            Some(Err(problem)) => problems.push(problem),
+            None => {}
+        }
+        match result.ready {
             Ok(ready) => {
                 self.ready = Some(ready);
                 self.ready_failed = false;
@@ -304,46 +427,34 @@ impl App {
                 self.ready_failed = true;
             }
         }
-        self.metrics = match fetch_ok(client, &format!("{}/metrics", self.url), &[]) {
-            Ok(text) => Some(parse_prometheus(&text)),
+        self.metrics = match result.metrics {
+            Ok(metrics) => Some(metrics),
             Err(error) => {
                 problems.push(("/metrics", error));
                 None
             }
         };
-        problems.extend(self.refresh_selection(client));
-        let elapsed = started.elapsed();
-        self.refresh_time = Some(elapsed);
+        match result.selection {
+            Some(Ok(selection)) => self.selection = Some(selection),
+            Some(Err(error)) => {
+                self.selection = None;
+                problems.push(("/sql", error));
+            }
+            None => {}
+        }
+        self.refresh_time = Some(result.elapsed);
         self.problems = problems;
         if !self.ready_failed {
-            self.record_sample(elapsed);
+            self.record_sample(result.elapsed);
         }
         self.last_refresh = Some(Instant::now());
     }
 
-    /// Only the two SQL queries depend on the selected table, so moving the selection reruns those
-    /// and nothing else.
-    fn refresh_selection(&mut self, client: &Client) -> Option<Problem> {
-        let identity = self.identity.as_ref()?;
-        if identity.sql != SqlAccess::Open {
-            self.selection = None;
-            return None;
-        }
-        let table = identity
-            .tables
-            .tables
-            .get(self.selected_table)?
-            .table
-            .clone();
-        match fetch_selection(client, &self.url, &table) {
-            Ok(selection) => {
-                self.selection = Some(selection);
-                None
-            }
-            Err(error) => {
-                self.selection = None;
-                Some(("/sql", error))
-            }
+    fn apply_selection(&mut self, result: Result<Selection, String>) {
+        self.problems.retain(|(endpoint, _)| *endpoint != "/sql");
+        match result {
+            Ok(selection) => self.selection = Some(selection),
+            Err(error) => self.problems.push(("/sql", error)),
         }
     }
 
@@ -367,7 +478,7 @@ impl App {
             self.samples.clear();
             self.activity.buckets.clear();
             // A restart may have come with a new configuration, and so a new catalogue.
-            self.identity = None;
+            self.refetch_identity = true;
         }
         let rpc_delta = self
             .samples
@@ -411,26 +522,29 @@ impl App {
             .max(self.poll_interval())
     }
 
-    fn select_next(&mut self, client: &Client) {
-        let count = self.table_count();
-        if count > 0 {
-            self.selected_table = (self.selected_table + 1) % count;
-            self.reselect(client);
+    /// Moves the selection, clamped to the list, and returns the table to query if it changed and
+    /// the nest allows asking.
+    fn select(&mut self, index: usize) -> Option<String> {
+        let last = self.table_count().checked_sub(1)?;
+        let index = index.min(last);
+        if index == self.selected_table {
+            return None;
         }
+        self.selected_table = index;
+        self.identity
+            .as_ref()
+            .filter(|identity| identity.sql == SqlAccess::Open)?;
+        self.selected_table_name().map(str::to_owned)
     }
 
-    fn select_previous(&mut self, client: &Client) {
-        let count = self.table_count();
-        if count > 0 {
-            self.selected_table = (self.selected_table + count - 1) % count;
-            self.reselect(client);
-        }
+    fn select_next(&mut self) -> Option<String> {
+        let count = self.table_count().max(1);
+        self.select((self.selected_table + 1) % count)
     }
 
-    fn reselect(&mut self, client: &Client) {
-        self.problems.retain(|(endpoint, _)| *endpoint != "/sql");
-        let problem = self.refresh_selection(client);
-        self.problems.extend(problem);
+    fn select_previous(&mut self) -> Option<String> {
+        let count = self.table_count().max(1);
+        self.select((self.selected_table + count - 1) % count)
     }
 
     fn table_count(&self) -> usize {
@@ -610,7 +724,7 @@ fn main() -> Result<()> {
 
     let _screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    run(&mut terminal, &client, &mut app, &quit)
+    run(&mut terminal, client, &mut app, &quit)
 }
 
 /// Raw mode and the alternate screen, undone on drop. A signal is turned into an ordinary return
@@ -683,30 +797,60 @@ fn normalize_url(value: String) -> String {
 
 fn run<B: Backend>(
     terminal: &mut Terminal<B>,
-    client: &Client,
+    client: Client,
     app: &mut App,
     quit: &AtomicBool,
 ) -> Result<()> {
+    let (requests, replies) = spawn_worker(client, app.url.clone());
+    let send = |request| {
+        requests
+            .send(request)
+            .map_err(|_| anyhow::anyhow!("the fetch thread has stopped"))
+    };
     loop {
+        for reply in replies.try_iter() {
+            match reply {
+                Reply::Poll(result) => app.apply(*result),
+                Reply::Selection(result) => app.apply_selection(result),
+            }
+        }
         if app.refresh_due() {
-            app.refresh(client);
+            app.poll_in_flight = true;
+            send(Request::Poll(app.poll_request()))?;
         }
         terminal.draw(|frame| draw(frame, app))?;
 
-        if event::poll(Duration::from_millis(100))?
+        if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            match key.code {
+            let query = match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.should_quit = true
+                    app.should_quit = true;
+                    None
                 }
-                KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-                KeyCode::Char('r') => app.refresh(client),
-                KeyCode::Char('w') => app.cycle_rate_window(),
-                KeyCode::Down | KeyCode::Char('j') => app.select_next(client),
-                KeyCode::Up | KeyCode::Char('k') => app.select_previous(client),
-                _ => {}
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    app.should_quit = true;
+                    None
+                }
+                KeyCode::Char('r') => {
+                    app.last_refresh = None;
+                    None
+                }
+                KeyCode::Char('w') => {
+                    app.cycle_rate_window();
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
+                KeyCode::PageDown => app.select(app.selected_table.saturating_add(TABLE_PAGE)),
+                KeyCode::PageUp => app.select(app.selected_table.saturating_sub(TABLE_PAGE)),
+                KeyCode::Home | KeyCode::Char('g') => app.select(0),
+                KeyCode::End | KeyCode::Char('G') => app.select(usize::MAX),
+                _ => None,
+            };
+            if let Some(table) = query {
+                send(Request::Selection(table))?;
             }
         }
         if app.should_quit || quit.load(Ordering::Relaxed) {
@@ -1219,25 +1363,32 @@ fn draw(frame: &mut Frame, app: &App) {
         Layout::vertical([Constraint::Percentage(100)]).split(bottom[1])
     };
     let show_sparkline = show_feed && right[1].height >= 9;
-    let rows: Vec<ListItem> = identity
+    let tables = identity
         .map(|identity| identity.tables.tables.as_slice())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let rows: Vec<ListItem> = tables
         .iter()
-        .enumerate()
-        .map(|(index, table)| {
-            let selected = index == app.selected_table;
-            ListItem::new(Line::from(Span::styled(
-                &table.table,
-                Style::default()
-                    .fg(if selected { Color::Black } else { Color::White })
-                    .bg(if selected { Color::Cyan } else { Color::Reset }),
-            )))
-        })
+        .map(|table| ListItem::new(table.table.as_str()).style(Style::default().fg(Color::White)))
         .collect();
-    frame.render_widget(
-        List::new(rows).block(panel("INDEXED TABLES  ↑↓ / j k to inspect")),
+    let mut list_state = ListState::default()
+        .with_offset(app.table_offset.get())
+        .with_selected((!tables.is_empty()).then_some(app.selected_table));
+    frame.render_stateful_widget(
+        List::new(rows)
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+            .block(panel(&if tables.is_empty() {
+                "INDEXED TABLES".to_owned()
+            } else {
+                format!(
+                    "INDEXED TABLES  {}/{}  ↑↓ j k",
+                    app.selected_table + 1,
+                    tables.len()
+                )
+            })),
         left[0],
+        &mut list_state,
     );
+    app.table_offset.set(list_state.offset());
 
     let rpc_per_second = app.rate(|sample| sample.rpc_requests);
     let method_per_second = app.rate(|sample| sample.rpc_methods);
@@ -1739,6 +1890,51 @@ mod tests {
         assert!(!reversed("usdc__transfer"));
     }
 
+    fn with_many_tables(count: usize) -> App {
+        let mut app = populated();
+        let identity = app.identity.as_mut().unwrap();
+        identity.tables = Tables {
+            count,
+            tables: (0..count)
+                .map(|index| EventTable {
+                    table: format!("graph__table_{index:03}"),
+                })
+                .collect(),
+        };
+        app
+    }
+
+    /// On an 81-table nest the selection used to walk off the bottom of an unscrolled list.
+    #[test]
+    fn the_table_list_scrolls_to_the_selection_and_holds_its_place() {
+        let mut app = with_many_tables(81);
+        app.selected_table = 70;
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains("graph__table_070"), "{screen}");
+        assert!(!screen.contains("graph__table_000"), "{screen}");
+        assert!(screen.contains("INDEXED TABLES  71/81"), "{screen}");
+        let offset = app.table_offset.get();
+        app.selected_table = 68;
+        render(&app, 100, 30);
+        assert_eq!(
+            app.table_offset.get(),
+            offset,
+            "moving up inside the view should not scroll it"
+        );
+    }
+
+    #[test]
+    fn paging_and_the_ends_clamp_to_the_list() {
+        let mut app = with_many_tables(81);
+        assert_eq!(app.select(usize::MAX).as_deref(), Some("graph__table_080"));
+        assert_eq!(app.select(app.selected_table + TABLE_PAGE), None);
+        assert_eq!(app.select(0).as_deref(), Some("graph__table_000"));
+        assert_eq!(app.select_previous().as_deref(), Some("graph__table_080"));
+        assert_eq!(app.select_next().as_deref(), Some("graph__table_000"));
+        app.identity = None;
+        assert_eq!(app.select_next(), None);
+    }
+
     #[test]
     fn prometheus_parser_keeps_plain_metrics_only() {
         let metrics = parse_prometheus(
@@ -1999,6 +2195,21 @@ mod tests {
         hits: Arc<Mutex<Vec<String>>>,
     }
 
+    /// The worker's two halves, run in line so a test can drive the app without a thread.
+    impl App {
+        fn refresh(&mut self, client: &Client) {
+            let request = self.poll_request();
+            self.poll_in_flight = true;
+            self.apply(poll(client, &self.url, &request));
+        }
+
+        fn query(&mut self, client: &Client, table: Option<String>) {
+            if let Some(table) = table {
+                self.apply_selection(fetch_selection(client, &self.url, &table));
+            }
+        }
+    }
+
     impl TestNest {
         fn serve(routes: impl Fn(&str) -> (u16, String) + Send + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -2101,7 +2312,8 @@ mod tests {
         let nest = TestNest::serve(healthy);
         let (mut app, client) = nest.app();
         app.refresh(&client);
-        app.select_next(&client);
+        let table = app.select_next();
+        app.query(&client, table);
         assert_eq!(nest.hits("/ready"), 1);
         assert_eq!(nest.hits("/sql"), 4);
         assert_eq!(app.selection.as_ref().unwrap().table, "usdc__transfer");
@@ -2213,12 +2425,61 @@ mod tests {
         });
         let (mut app, client) = nest.app();
         app.refresh(&client);
-        app.select_next(&client);
+        assert_eq!(app.select_next(), None);
         assert_eq!(nest.hits("/sql"), 0);
         assert!(app.problems.is_empty(), "{:?}", app.problems);
         let screen = render(&app, 100, 33);
         assert!(screen.contains("SQL is closed on this nest"), "{screen}");
         assert!(screen.contains("top_holders"), "{screen}");
+    }
+
+    /// Holding `j` must not queue a round trip per keypress behind a slow nest.
+    #[test]
+    fn the_worker_asks_only_for_the_last_of_a_burst_of_selections() {
+        let nest = TestNest::serve(|target| {
+            if target == "/ready" {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            healthy(target)
+        });
+        let (requests, replies) = spawn_worker(Client::new(), nest.base.clone());
+        requests
+            .send(Request::Poll(PollRequest {
+                identity: true,
+                table: None,
+                sql_open: true,
+            }))
+            .unwrap();
+        for table in ["usdc__transfer", "usdc__approval", "usdc__transfer"] {
+            requests.send(Request::Selection(table.into())).unwrap();
+        }
+        let first = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(first, Reply::Poll(_)));
+        let Reply::Selection(Ok(selection)) = replies.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("expected a selection reply");
+        };
+        assert_eq!(selection.table, "usdc__transfer");
+        assert!(replies.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(
+            nest.hits("/sql"),
+            4,
+            "two for the poll, two for the last selection"
+        );
+    }
+
+    #[test]
+    fn a_refetched_catalogue_keeps_the_selected_table() {
+        let nest = TestNest::serve(healthy);
+        let (mut app, client) = nest.app();
+        app.refresh(&client);
+        let table = app.select_next();
+        app.query(&client, table);
+        app.refetch_identity = true;
+        app.refresh(&client);
+        assert_eq!(nest.hits("/tables"), 2);
+        assert_eq!(app.selected_table_name(), Some("usdc__transfer"));
+        assert_eq!(app.selection.as_ref().unwrap().table, "usdc__transfer");
     }
 
     #[test]
