@@ -70,7 +70,8 @@ nuthatch-tui-client [--url URL] [--ssh HOST] [--nest NAME] [--interval 5s]
   --url URL       the nest's API, as seen from where it runs (default http://127.0.0.1:8288)
   --ssh HOST      reach it through an ssh forward to HOST, for a nest bound to loopback there
   --nest NAME     take url and ssh from NAME in ~/.config/nuthatch-tui/nests.toml
-  --interval DUR  poll this often instead of as often as the nest polls";
+  --interval DUR  poll this often instead of as often as the nest polls
+  --version       print the version";
 
 pub(crate) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args> {
     let mut parsed = Args::default();
@@ -81,6 +82,10 @@ pub(crate) fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args>
             "--ssh" => parsed.ssh = Some(value("an ssh host")?),
             "--nest" => parsed.nest = Some(value("a name from nests.toml")?),
             "--interval" => parsed.interval = Some(parse_interval(&value("a duration, e.g. 5s")?)?),
+            "-V" | "--version" => {
+                println!("nuthatch-tui-client {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);

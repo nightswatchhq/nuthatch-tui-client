@@ -72,6 +72,23 @@ The default target is `http://127.0.0.1:8288`, Nuthatch's default local listener
 
 ## Install and run
 
+Released binaries are built for Apple Silicon macOS and x86_64 Linux (glibc 2.35 or newer), each with a checksum and a build-provenance attestation:
+
+```sh
+target=x86_64-unknown-linux-gnu   # or aarch64-apple-darwin
+base=https://github.com/nightswatchhq/nuthatch-tui-client/releases/latest/download
+curl -LO "$base/nuthatch-tui-client-$target.tar.gz"
+curl -LO "$base/nuthatch-tui-client-$target.tar.gz.sha256"
+shasum -a 256 -c "nuthatch-tui-client-$target.tar.gz.sha256"
+gh attestation verify "nuthatch-tui-client-$target.tar.gz" --repo nightswatchhq/nuthatch-tui-client
+tar xzf "nuthatch-tui-client-$target.tar.gz"
+./nuthatch-tui-client --version
+```
+
+The checksum says the download is intact; the attestation says this repository's release workflow built it. On a nest's own host that saves installing a Rust toolchain to watch it.
+
+With a toolchain, `cargo install --git https://github.com/nightswatchhq/nuthatch-tui-client --locked` builds the current `main`.
+
 From a checkout:
 
 ```sh
