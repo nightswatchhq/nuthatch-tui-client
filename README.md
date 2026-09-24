@@ -108,7 +108,7 @@ ssh = "89.167.109.4"
 url = "http://127.0.0.1:18288"
 ```
 
-and opened with `--nest allocations`. `--url` and `--ssh` given alongside it take precedence over the entry.
+and opened with `--nest allocations`. `--url` and `--ssh` given alongside it take precedence over the entry. Started with none of `--url`, `--ssh` or `--nest`, the client lists the configured nests and opens the one chosen with `Enter`.
 
 ### Runtimes
 
@@ -198,7 +198,7 @@ The dashboard degrades each of these independently rather than displaying a misl
 - It reports request count, not exact provider cost. Billing models differ by provider and method.
 - On Nuthatch before 3.0.0, CPU utilisation is only accurate when the nest itself is Linux-hosted; a Mac-hosted nest reports a flat `0.0%` rather than `unavailable` ([nightswatchhq/nuthatch#844](https://github.com/nightswatchhq/nuthatch/issues/844)).
 - A restart is only seen if it happens while the client is watching, and only if the counters have not climbed past their old values by the next sample. A restart before the client started is invisible to it.
-- `--ssh` needs non-interactive authentication to the host. There is no picker yet: a named nest is chosen with `--nest`.
+- `--ssh` needs non-interactive authentication to the host.
 - The screen wants 100 columns by 30 rows for everything at once. It stays usable smaller, in the order set out under [Terminal size](#terminal-size), but the performance panel's longest lines truncate below 100 columns.
 
 ## Terminal size
